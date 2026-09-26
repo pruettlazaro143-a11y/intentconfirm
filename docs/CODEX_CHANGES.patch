@@ -1,0 +1,826 @@
+--- a/src/core.js
++++ b/src/core.js
+@@ -19,11 +19,13 @@
+   function fresh() {
+     return {
+       schemaVersion: 1,
++      engineRevision: 3,
+       intent: '',
+       scenario: 'website',
+       answers: {},
+       facts: [],       // ExtractedFact[]
+-      ambiguities: [], // string[]
++      ambiguities: [], // extraction observations; resolved state is computed
++      dismissedFacts: [],
+       history: [],
+       activeRevision: null
+     };
+@@ -73,7 +75,7 @@
+         why: detailWhy(s),
+         options: detailOptions(s),
+         required: true,
+-        importance: 9,
++        importance: 7,
+         dependsOn: null
+       },
+       {
+@@ -94,12 +96,13 @@
+         importance: 8,
+         dependsOn: null
+       },
++      { id: 'constraints', title: '还有哪些预算、时间或其他限制必须保留？', why: '规则识别不完整，请核对原文中尚未进入确认单的重要条件。', options: ['没有其他限制', '需要补充具体限制'], required: /预算|元|截止|[一二三四五六七八九十两0-9]+[天周月]|最好|至少|最多/.test(s.intent), importance: 8, dependsOn: null },
+       // Contextual follow-up: AI role clarification (activated when intent mentions AI but role unclear)
+       {
+         id: 'ai_role',
+         title: '你提到了 AI，AI 在这里的具体作用是什么？',
+         why: 'AI 的用途决定了系统架构、复杂度与成本；未明确时无法评估可行性。',
+-        options: ['AI 生成或批改内容', 'AI 个性化推荐', 'AI 辅助搜索或总结', 'AI 作为对话或辅导界面'],
++        options: ['AI 生成或批改内容', 'AI 个性化推荐', 'AI 辅助搜索或总结', 'AI 作为对话或辅导界面', '本次不使用 AI'],
+         required: true,
+         importance: 10,
+         dependsOn: null, // activated by extract(), not dependsOn
+@@ -110,8 +113,8 @@
+         id: 'speaking_input',
+         title: '口语练习时，你希望怎么输入语音？',
+         why: '录音方式（实时录制 vs 文件上传）影响技术方案与使用体验。',
+-        options: ['实时麦克风录音', '上传音频文件', '先文字后转换', '暂不确定'],
+-        required: false,
++        options: ['实时麦克风录音', '上传音频文件', '先做文字模拟，不接真实语音'],
++        required: true,
+         importance: 7,
+         dependsOn: { field: 'detail', value: '练习与反馈' },
+         contextual: true
+@@ -129,24 +132,23 @@
+       }
+     ];
+ 
+-    // Filter to only questions applicable to this state
+     return catalogue.filter(q => {
+       if (!q.contextual) return true;
+-      if (q.id === 'ai_role') {
+-        // Show if intent mentions AI/人工智能 and ai_role hasn't been answered
+-        return needsAiRoleQuestion(s);
+-      }
+-      if (q.dependsOn) {
+-        return s.answers[q.dependsOn.field]?.value === q.dependsOn.value;
+-      }
++      if (q.id === 'ai_role') return needsAiRoleQuestion(s);
++      if (q.id === 'speaking_input') {
++        const detail = s.answers.detail;
++        return s.scenario === 'website' && detail?.status === 'confirmed' && /口语|语音|录音/.test(detail.value) && !/不做|不需要|不要/.test(detail.value);
++      }
++      if (q.dependsOn) return s.scenario === 'website' && s.answers[q.dependsOn.field]?.status === 'confirmed' && s.answers[q.dependsOn.field]?.value === q.dependsOn.value;
+       return false;
+-    });
++    }).map(q => ({...q, required: q.required || s.answers[q.id]?.value === '需要补充具体限制' || (s.facts || []).some(f => f.field === q.id && !(s.dismissedFacts || []).includes(f.id))}));
+   }
+ 
+   function needsAiRoleQuestion(s) {
+-    const intentLower = s.intent.toLowerCase();
+-    const mentionsAI = /\bai\b|人工智能|智能/.test(intentLower);
+-    return mentionsAI && !s.answers.ai_role;
++    // Applicability must not disappear merely because an answer exists.
++    // Confirmed answers stay in the catalogue/export and can be edited.
++    const signal = /\bai\b|人工智能/i;
++    return signal.test(s.intent) || Object.entries(s.answers).some(([k,a]) => k !== 'ai_role' && a.status === 'confirmed' && signal.test(a.value)) || !!s.answers.ai_role;
+   }
+ 
+   function detailTitle(s) {
+@@ -166,7 +168,7 @@
+     if (s.scenario === 'writing') return ['给出具体案例', '解释原因与过程', '给出可执行的建议'];
+     if (s.scenario === 'general') return ['整理成清单', '列出方案及取舍', '制作可编辑的成果'];
+     const goal = s.answers.goal?.value || '';
+-    if (goal === '学习与练习') return ['练习与反馈', '学习记录与进度', '个性化学习计划'];
++    if (goal === '学习与练习') return ['口语练习与反馈', '作文练习与反馈', '学习记录与进度', '个性化学习计划'];
+     if (goal === '展示作品或业务') return ['作品展示与分类', '服务介绍与联系入口', '个人经历与能力介绍'];
+     return ['输入和保存信息', '搜索与筛选信息', '统计与进度展示'];
+   }
+@@ -175,7 +177,7 @@
+     // Derive from extracted facts: if "不要登录" detected, pre-show it as known
+     const noLogin = s.facts?.some(f => f.field === 'exclude' && /登录/.test(f.value));
+     const base = s.scenario === 'website'
+-      ? ['不做登录与支付', '不做社交和排行榜', '暂不设排除项']
++      ? ['不做登录', '不做支付', '不做社交和排行榜', '暂不设排除项']
+       : ['不增加未经核实的事实', '不展开无关主题', '暂不设排除项'];
+     return base;
+   }
+@@ -193,75 +195,54 @@
+      "covered" = input is within rule coverage (false → honest degradation)
+   ───────────────────────────────────────────── */
+   function extract(intent, scenario) {
+-    const text = intent.trim();
+-    const lower = text.toLowerCase();
+-    const facts = [];
+-    const ambiguities = [];
+-
+-    // ── AUDIENCE ──
+-    if (/\b我自己\b|个人|自用|给自己/.test(lower)) {
+-      facts.push({ field: 'audience', value: '我自己', evidence: matchEvidence(text, /我自己|个人|自用|给自己/), status: 'fact-candidate' });
+-    }
+-
+-    // ── GOAL ──
+-    if (/雅思|ielts/i.test(text)) {
+-      if (/练习|训练|备考|学习/.test(lower)) {
+-        facts.push({ field: 'goal', value: '学习与练习', evidence: matchEvidence(text, /练习|训练|备考|学习/), status: 'fact-candidate' });
+-      } else {
+-        // IELTS mentioned but no clear goal verb → ambiguity
+-        ambiguities.push('提到了雅思，但尚未明确是练习、备考还是其他目标。');
+-      }
+-    }
+-    if (/展示|作品|portfolio/i.test(lower)) {
+-      facts.push({ field: 'goal', value: '展示作品或业务', evidence: matchEvidence(text, /展示|作品|portfolio/i), status: 'fact-candidate' });
+-    }
+-    if (/记录|管理|笔记|日志/.test(lower)) {
+-      facts.push({ field: 'goal', value: '记录和管理信息', evidence: matchEvidence(text, /记录|管理|笔记|日志/), status: 'fact-candidate' });
+-    }
+-
+-    // ── EXCLUDE ──
+-    if (/不(要|需要|做|用)(登录|注册|账号|账户)/.test(lower)) {
+-      facts.push({ field: 'exclude', value: '不做登录与支付', evidence: matchEvidence(text, /不.{0,3}(登录|注册|账号|账户)/), status: 'fact-candidate' });
+-    }
+-    if (/不(要|需要|做)(社交|排行榜|榜)/.test(lower)) {
+-      facts.push({ field: 'exclude', value: '不做社交和排行榜', evidence: matchEvidence(text, /不.{0,3}(社交|排行)/), status: 'fact-candidate' });
+-    }
+-
+-    // ── DETAIL / specific feature mentions ──
+-    if (/每日练习|日常练习|每天练/.test(lower)) {
+-      facts.push({ field: 'detail', value: '学习记录与进度', evidence: matchEvidence(text, /每日练习|日常练习|每天练/), status: 'fact-candidate' });
+-    }
+-    if (/口语/.test(lower)) {
+-      facts.push({ field: 'detail', value: '练习与反馈', evidence: matchEvidence(text, /口语/), status: 'fact-candidate' });
+-    }
+-    if (/写作|作文/.test(lower)) {
+-      facts.push({ field: 'detail', value: '练习与反馈', evidence: matchEvidence(text, /写作|作文/), status: 'fact-candidate' });
+-    }
+-
+-    // ── AI AMBIGUITY ──
+-    if (/\bai\b|人工智能/i.test(text)) {
+-      const hasRole = /ai.{0,10}(生成|批改|推荐|辅导|搜索|总结|分析|对话|辅助)/i.test(text) ||
+-                      /(生成|批改|推荐|辅导|搜索|总结|分析|对话|辅助).{0,10}ai/i.test(text);
+-      if (!hasRole) {
+-        ambiguities.push('提到了 AI，但 AI 的具体作用尚未明确（生成内容？个性化推荐？辅导界面？）。');
+-      }
+-    }
+-
+-    // ── COVERAGE CHECK ──
+-    // "covered" means we found at least one extractable signal
+-    // Inputs with zero signals are honest degradations
+-    const covered = facts.length > 0 || ambiguities.length > 0;
+-
+-    return { facts, ambiguities, covered };
+-  }
+-
+-  function matchEvidence(text, pattern) {
+-    const m = text.match(pattern);
+-    if (!m) return '';
+-    const idx = m.index;
+-    const start = Math.max(0, idx - 8);
+-    const end = Math.min(text.length, idx + m[0].length + 8);
+-    return '…' + text.slice(start, end) + '…';
++    const text = intent.trim(), facts = [], ambiguities = [];
++    const clauses = [...text.matchAll(/[^，。；！？,;!?\n]+/g)].map(m=>({text:m[0].trim(), start:m.index})).filter(c=>c.text);
++    function add(field, value, clause) {
++      if (!facts.some(f=>f.field===field && f.value===value)) facts.push({id:`FACT-${facts.length+1}`,field,value,evidence:clause.text,status:'fact-candidate'});
++    }
++    for (const clause of clauses) {
++      const c = clause.text;
++      // Prefer abstention to treating a negated keyword as a positive feature.
++      const negated = /不|不要|不需要|别|无需|禁止|避免|而非|并非|not\b|without\b/i.test(c);
++      if (!negated && /给(?:我)?自己(?:用|使用)?|我自己(?:用|使用)|自用|仅供个人/.test(c)) add('audience','我自己',clause);
++      if (!negated && /面向公众|公开用户|所有人使用/.test(c)) add('audience','公开用户',clause);
++      if (!negated && /面向学生|给学生用|给团队用/.test(c)) add('audience','一个明确的小群体',clause);
++      if (scenario === 'website' && !negated) {
++        if (/雅思|ielts/i.test(c) && /练习|训练|备考|学习/.test(c)) add('goal','学习与练习',clause);
++        if (/作品展示|展示作品|作品集|portfolio/i.test(c)) add('goal','展示作品或业务',clause);
++        if (/记录|管理|笔记|日志/.test(c) && !/练习|学习/.test(c)) add('goal','记录和管理信息',clause);
++        if (/口语/.test(c)) add('detail','口语练习与反馈',clause);
++        if (/作文|写作练习/.test(c)) add('detail','作文练习与反馈',clause);
++        if (/记录.*(?:每日|每天|日常).*练习|(?:每日|每天|日常).*练习.*记录/.test(c)) add('detail','记录每日练习',clause);
++        if (/可点击原型|点击原型/.test(c)) add('delivery','可点击原型',clause);
++      }
++      if (scenario === 'writing' && !negated) {
++        if (/解释|讲解/.test(c)) add('goal','解释一件事',clause);
++        if (/个人观点|我的看法/.test(c)) add('goal','表达个人观点',clause);
++        if (/介绍.*产品|介绍.*服务/.test(c)) add('goal','介绍产品或服务',clause);
++      }
++      if (negated && /登录|注册|支付|付费|社交|排行|广告|云端|上传/.test(c)) {
++        // Preserve exact wording, including qualified or compound negation.
++        // "不要登录" must NEVER grow into "不要登录与支付".
++        add('exclude',c,clause);
++      }
++      if (/预算|[0-9]+\s*(元|块)|截止|[一二三四五六七八九十两0-9]+[天周月]|至少|最多/.test(c)) add('constraints',c,clause);
++      if (!negated && /\bai\b|人工智能/i.test(c) && /生成|批改|推荐|辅导|搜索|总结|分析|对话/.test(c)) add('ai_role',c,clause);
++    }
++    // Multiple exact restrictions are additive. Competing goals/details require selection.
++    for (const field of ['exclude','constraints']) {
++      const found = facts.filter(f=>f.field===field);
++      if (found.length>1) {
++        facts.splice(0,facts.length,...facts.filter(f=>f.field!==field),{id:found[0].id,field,value:found.map(f=>f.value).join('；'),evidence:found.map(f=>f.evidence).join('；'),status:'fact-candidate'});
++      }
++    }
++    if (/雅思|ielts/i.test(text) && !facts.some(f=>f.field==='goal')) ambiguities.push('提到了雅思，请确认主要目标。');
++    if (/\bai\b|人工智能/i.test(text) && !facts.some(f=>f.field==='ai_role')) ambiguities.push('提到了 AI，请确认具体作用，或明确本次不使用 AI。');
++    for (const field of ['audience','goal','detail','delivery','ai_role']) {
++      if (facts.filter(f=>f.field===field).length>1) ambiguities.push(`原文包含多个 ${field} 候选，请选择优先项，或用自定义回答保留组合需求。`);
++    }
++    // A signal is not full semantic coverage. Coverage is ALWAYS partial/unknown.
++    return { facts, ambiguities, covered: facts.length>0 || ambiguities.length>0, coverage: facts.length || ambiguities.length ? 'partial' : 'unknown' };
+   }
+ 
+   /* ─────────────────────────────────────────────
+@@ -271,16 +252,11 @@
+   ───────────────────────────────────────────── */
+   function nextQuestions(s) {
+     const qs = questions(s);
+-    const pending = qs.filter(q => {
+-      const ans = s.answers[q.id];
+-      if (!ans) return true;                          // never answered
+-      if (ans.status === 'stale') return true;        // needs reconfirmation
+-      if (ans.status === 'pending') return true;      // marked unknown
+-      return false;                                   // confirmed → skip
+-    });
+-
+-    // Sort: required first, then by importance desc
+-    pending.sort((a, b) => {
++    const pending = qs.filter(q => !s.answers[q.id] || s.answers[q.id].status !== 'confirmed');
++    pending.sort((a,b) => {
++      // Defer explicit uncertainty so it cannot monopolize all three slots.
++      const da = s.answers[a.id]?.kind === 'unknown', db = s.answers[b.id]?.kind === 'unknown';
++      if (da !== db) return da ? 1 : -1;
+       if (a.required !== b.required) return a.required ? -1 : 1;
+       return (b.importance || 0) - (a.importance || 0);
+     });
+@@ -306,41 +282,51 @@
+      Precise: only fields that actually depend on the changed field.
+   ───────────────────────────────────────────── */
+   const DEPENDENCY_GRAPH = {
+-    // If goal changes, detail options change → detail stale; success depends on detail
+-    goal: ['detail', 'success'],
+-    // If delivery changes, success criteria may need revisiting
++    goal: ['detail','success','ai_role','portfolio_content'],
+     delivery: ['success'],
+-    // audience and exclude are independent
+-    audience: [],
+-    exclude: [],
+-    detail: ['success'],
+-    success: [],
+-    ai_role: [],
+-    speaking_input: [],
+-    portfolio_content: []
++    audience: ['success'],
++    exclude: ['success'],
++    constraints: ['success'],
++    detail: ['success','speaking_input','ai_role'],
++    success: [], ai_role: ['success'], speaking_input: ['success'], portfolio_content: ['success']
+   };
+-
+   function setAnswer(s, id, value, kind = 'selection') {
+-    if (!questions(s).some(q => q.id === id)) throw Error('Unknown question');
+-    if (!['selection','custom','unknown'].includes(kind)) throw Error('Unknown answer source');
+-    if (kind === 'unknown') {
+-      // "unknown" answer — keep as pending, value is the placeholder text
+-      const n = copy(s);
+-      if (s.answers[id]?.kind === 'unknown' && s.answers[id]?.status === 'pending') return n;
+-      n.answers[id] = { value: value.trim() || '暂不确定', kind: 'unknown', status: 'pending' };
+-      n.activeRevision = null;
+-      return n;
+-    }
+-    if (!value.trim() || value.length > 1000) throw Error('回答应为 1–1000 字。');
+-    const n = copy(s);
+-    if (s.answers[id]?.value === value && s.answers[id]?.kind === kind && s.answers[id]?.status === 'confirmed') return n;
+-    n.answers[id] = { value: value.trim(), kind, status: 'confirmed' };
+-    // Mark dependents stale — only those in the dependency graph
+-    for (const dep of (DEPENDENCY_GRAPH[id] || [])) {
+-      if (n.answers[dep]) n.answers[dep].status = 'stale';
+-    }
+-    n.activeRevision = null;
++    if (!questions(s).some(q => q.id === id)) throw Error('当前场景不适用这个问题。');
++    if (!['selection','custom','unknown','fact-confirmed'].includes(kind)) throw Error('Unknown answer source');
++    if (typeof value !== 'string' || !value.trim() || value.length > 2000) throw Error('回答应为 1–2000 字。');
++    value = value.trim();
++    if (/^(暂不确定|不确定|不知道|需要补充具体限制)$/.test(value)) kind='unknown';
++    const fact = (s.facts || []).find(f=>f.field===id && f.value===value && !(s.dismissedFacts || []).includes(f.id));
++    if (kind==='fact-confirmed' && !fact) throw Error('候选已失效，请重新选择。');
++    const status = kind==='unknown' ? 'pending' : 'confirmed';
++    const n = copy(s), old=s.answers[id];
++    if (old?.value===value && old?.kind===kind && old?.status===status) return n;
++    n.answers[id] = {value,kind,status,...(kind==='fact-confirmed' ? {evidence:fact.evidence, factId:fact.id} : {})};
++    // Reconfirming unchanged content does not invalidate unrelated downstream choices.
++    const semanticChange = !!old && (old.value!==value || (old.kind==='unknown')!==(kind==='unknown'));
++    if (semanticChange) {
++      const seen=new Set(), todo=[...(DEPENDENCY_GRAPH[id] || [])];
++      while(todo.length) {
++        const dep=todo.shift(); if(seen.has(dep))continue; seen.add(dep);
++        if(n.answers[dep])n.answers[dep].status='stale';
++        todo.push(...(DEPENDENCY_GRAPH[dep] || []));
++      }
++    }
++    n.activeRevision=null;
+     return n;
++  }
++
++  function confirmFact(s,id) {
++    const f=(s.facts || []).find(f=>f.id===id);
++    if(!f)throw Error('候选不存在。');
++    return setAnswer(s,f.field,f.value,'fact-confirmed');
++  }
++  function dismissFact(s,id) {
++    const f=(s.facts || []).find(f=>f.id===id);
++    if(!f)throw Error('候选不存在。');
++    const n=copy(s);n.dismissedFacts=[...new Set([...(n.dismissedFacts || []),id])];
++    if(n.answers[f.field]?.kind==='fact-candidate' && n.answers[f.field]?.value===f.value)delete n.answers[f.field];
++    n.activeRevision=null;return n;
+   }
+ 
+   /* ─────────────────────────────────────────────
+@@ -351,6 +337,8 @@
+   function applyFacts(s) {
+     let n = copy(s);
+     for (const fact of (s.facts || [])) {
++      if ((s.dismissedFacts || []).includes(fact.id)) continue;
++      if ((s.facts || []).filter(f=>f.field===fact.field && !(s.dismissedFacts || []).includes(f.id)).length!==1) continue;
+       if (n.answers[fact.field]) continue; // already answered — don't overwrite
+       // Validate field exists in question catalogue
+       if (!questions(n).some(q => q.id === fact.field)) continue;
+@@ -358,7 +346,7 @@
+         value: fact.value,
+         kind: 'fact-candidate',
+         status: 'pending',       // fact-candidates are pending, not confirmed
+-        evidence: fact.evidence  // preserve the original text fragment
++        evidence: fact.evidence, factId: fact.id  // preserve original evidence
+       };
+     }
+     return n;
+@@ -370,7 +358,7 @@
+ 
+   function rows(s) {
+     return questions(s).map((q, i) => ({
+-      id: `REQ-${String(i+1).padStart(3,'0')}`,
++      id: REQUIREMENT_IDS[q.id],
+       field: q.id,
+       question: q.title,
+       required: q.required,
+@@ -385,9 +373,10 @@
+       state: s.activeRevision ? 'confirmed' : 'draft',
+       originalIntent: s.intent,
+       scenario: s.scenario,
+-      engine: 'rule-baseline-v2',
+-      extractedFacts: s.facts || [],
+-      ambiguities: s.ambiguities || [],
++      engine: 'rule-baseline-v3-reviewed',
++      coverage: coverageReport(s),
++      extractedFacts: (s.facts || []).map(f=>({...f, decision: (s.dismissedFacts || []).includes(f.id) ? 'dismissed' : s.answers[f.field]?.status==='confirmed' && s.answers[f.field]?.value===f.value ? 'accepted' : s.answers[f.field]?.status==='confirmed' ? 'not-selected' : 'pending'})),
++      ambiguities: coverageReport(s).unresolved,
+       requirements: rows(s),
+       openQuestions: rows(s).filter(r => r.status !== 'confirmed').map(r => r.question),
+       verification: 'not-run'
+@@ -395,6 +384,7 @@
+   }
+ 
+   function confirm(s) {
++    if (!s.intent.trim()) throw Error('请先输入想法。');
+     if (blockers(s).length) throw Error('关键问题还未确认。');
+     const n = copy(s);
+     if (n.activeRevision) return n;
+@@ -416,7 +406,7 @@
+     ];
+     if (spec.extractedFacts && spec.extractedFacts.length) {
+       for (const f of spec.extractedFacts) {
+-        lines.push(`- [${f.field}] ${f.value}  ← 原文依据：${f.evidence || '（规则匹配）'}`);
++        lines.push(`- [${f.field}] ${f.value}  ← 原文依据：${f.evidence || '（规则匹配）'}；候选状态：${f.decision || 'pending'}（仅 accepted 可作为已采纳依据）`);
+       }
+     } else {
+       lines.push('- 未从原文识别到有证据的事实候选。');
+@@ -435,13 +425,15 @@
+       '', '## 开发与验收约定',
+       '按已确认范围实施；未决事项不可当作用户同意。遇到冲突先说明。',
+       '报告每条 REQ 对应的实现位置与实际验收结果。当前实现与验收均未验证。',
+-      '', '生成方式：规则基线 v2；没有调用在线模型。'
++      '', '## 覆盖范围提示', spec.coverage?.message || '规则仅部分识别原文，请人工核对遗漏。', '', '生成方式：规则基线 v3（审阅修订）；没有调用在线模型。'
+     );
+     return lines.join('\n');
+   }
+ 
+   // All possible question IDs across the full catalogue (for restore validation).
+-  const ALL_QUESTION_IDS = ['audience','goal','delivery','detail','exclude','success','ai_role','speaking_input','portfolio_content'];
++  const ALL_QUESTION_IDS = ['audience','goal','delivery','detail','exclude','success','ai_role','speaking_input','portfolio_content','constraints'];
++
++  const REQUIREMENT_IDS = Object.fromEntries(ALL_QUESTION_IDS.map((id,i)=>[id,`REQ-${String(i+1).padStart(3,'0')}`]));
+ 
+   function restore(raw) {
+     try {
+@@ -449,13 +441,29 @@
+       if (s.schemaVersion !== 1 || !scenarios[s.scenario] || typeof s.intent !== 'string' || s.intent.length > 2000 || !s.answers || Array.isArray(s.answers) || !Array.isArray(s.history)) return fresh();
+       // Use full catalogue IDs — some contextual questions may be answered and no longer "active"
+       for (const [k, v] of Object.entries(s.answers)) {
+-        if (!ALL_QUESTION_IDS.includes(k) || !v || typeof v.value !== 'string' || v.value.length > 1000 || !['selection','custom','unknown','fact-candidate'].includes(v.kind) || !['pending','confirmed','stale'].includes(v.status)) return fresh();
++        if (!ALL_QUESTION_IDS.includes(k) || !v || typeof v.value !== 'string' || v.value.length > 2000 || !['selection','custom','unknown','fact-candidate','fact-confirmed'].includes(v.kind) || !['pending','confirmed','stale'].includes(v.status)) return fresh();
+       }
+       if (!(s.activeRevision === null || (Number.isInteger(s.activeRevision) && s.activeRevision > 0 && s.activeRevision <= s.history.length))) return fresh();
+-      if (s.activeRevision && blockers(s).length) return fresh();
++
+       // Restore facts/ambiguities arrays if present
+       if (!Array.isArray(s.facts)) s.facts = [];
+       if (!Array.isArray(s.ambiguities)) s.ambiguities = [];
++      if (!s.facts.every(f=>f && ALL_QUESTION_IDS.includes(f.field) && typeof f.value==='string' && typeof f.evidence==='string')) return fresh();
++      if (s.engineRevision===3 && !s.facts.every(f=>typeof f.id==='string' && /^FACT-[0-9]+$/.test(f.id))) return fresh();
++      if (!s.ambiguities.every(a=>typeof a==='string')) return fresh();
++      if (!s.history.every(h=>h && typeof h.confirmedAt==='string' && h.specification && Array.isArray(h.specification.requirements))) return fresh();
++      if (!Array.isArray(s.dismissedFacts)) s.dismissedFacts=[];
++      if (s.engineRevision!==3) {
++        const extraction=extract(s.intent,s.scenario);
++        s.facts=extraction.facts;s.ambiguities=extraction.ambiguities;s.dismissedFacts=[];
++        for(const [id,a] of Object.entries(s.answers)) {
++          if(a.kind==='fact-candidate')delete s.answers[id];
++          else if(a.status==='confirmed')a.status='stale';
++        }
++        s.activeRevision=null;s.engineRevision=3;
++        s.migrationNotice='已保留旧草稿和历史版本。规则修复后，请重新核对当前答案。历史版本可能包含旧规则的问题。';
++      }
++      if(s.activeRevision && blockers(s).length)s.activeRevision=null;
+       return s;
+     } catch { return fresh(); }
+   }
+@@ -478,15 +486,14 @@
+      COVERAGE REPORT — honest degradation signal
+   ───────────────────────────────────────────── */
+   function coverageReport(s) {
+-    const { covered, facts, ambiguities } = extract(s.intent, s.scenario);
+-    return {
+-      covered,
+-      factCount: facts.length,
+-      ambiguityCount: ambiguities.length,
+-      message: covered
+-        ? null
+-        : '当前规则无法从这段文字中识别具体信息，将采用通用澄清流程。结果中不会包含无来源的已确认事实。'
+-    };
++    const {covered,facts}=extract(s.intent,s.scenario);
++    const unresolved=[];
++    if(needsAiRoleQuestion(s) && s.answers.ai_role?.status!=='confirmed')unresolved.push('AI 的具体作用仍需确认（也可以明确不使用 AI）。');
++    for(const field of ['audience','goal','detail','delivery']) {
++      if(facts.filter(f=>f.field===field && !(s.dismissedFacts || []).includes(f.id)).length>1 && s.answers[field]?.status!=='confirmed') unresolved.push(`${field} 存在多个候选，请明确优先项或组合需求。`);
++    }
++    return { covered, level: covered ? 'partial' : 'unknown', factCount:facts.length, unresolved,
++      message: covered ? '当前仅识别了部分规则信号，不代表已完整理解。请核对原文中的预算、时间、否定和组合需求；遗漏项可在“其他限制”或自定义回答中补充。' : '当前规则无法可靠抽取这段文字，将采用通用澄清。请逐项补充，系统不会把未识别的内容当成已理解。' };
+   }
+ 
+   return {
+@@ -497,6 +504,8 @@
+     start,
+     applyFacts,
+     setAnswer,
++    confirmFact,
++    dismissFact,
+     blockers,
+     rows,
+     specification,
+--- a/src/app.js
++++ b/src/app.js
+@@ -8,6 +8,7 @@
+   try { state = C.restore(localStorage.getItem(key)); } catch { storage = false; }
+   let step = state.intent ? 1 : 0, scenario = state.scenario;
+   let timer;
++  let batchIds = [], draftInputs = {};
+ 
+   function notify(msg) { $('#toast').textContent = msg; $('#toast').classList.add('show'); clearTimeout(timer); timer = setTimeout(()=>$('#toast').classList.remove('show'),4000); }
+   function persist() { try { localStorage.setItem(key,JSON.stringify(state)); } catch { storage = false; notify('浏览器无法保存草稿。请及时导出文件。'); } }
+@@ -27,48 +28,32 @@
+       b.classList.toggle('active', +b.dataset.step === step);
+       b.setAttribute('aria-current', +b.dataset.step === step ? 'step' : 'false');
+     });
++    document.querySelectorAll('[data-custom]').forEach(f=>{draftInputs[f.dataset.custom]=f.querySelector('input').value;});
+     $('#main').innerHTML = step === 0 ? entry() : step === 1 ? clarify() : review();
+     bind();
+   }
+ 
+   function entry() {
+-    return `<div class="eyebrow">FROM AN IDEA TO A SHARED UNDERSTANDING</div><h1>从你脑中的想法开始。</h1><p class="lead">不必先写一份完整需求。说出想法，再一起确认关键选择。</p><div class="grid"><section><form class="card" id="intent-form"><label class="input-label" for="intent">你想让 AI 帮你完成什么？</label><textarea class="intent-input" id="intent" maxlength="2000" required placeholder="比如：帮我做一个个人 AI 雅思网站……">${escape(state.intent)}</textarea><div class="label-row"><span class="hint">选择任务类型</span><small>原型暂不自动识别</small></div><div class="segments">${Object.entries(C.scenarios).map(([id,t])=>`<button type="button" class="segment ${scenario===id?'selected':''}" aria-pressed="${scenario===id}" data-scenario="${id}">${t.name}</button>`).join('')}</div><div class="actions"><span class="hint">${storage?'内容仅保存在当前浏览器':'当前浏览器无法保存，请及时导出'}</span><button class="primary" type="submit">开始梳理 <span>↗</span></button></div></form><div class="examples"><span class="examples-title">也可以从一个例子开始</span>${[['▧','帮我做一个个人 AI 雅思网站','website'],['✎','帮我写一篇介绍个人项目的文章','writing'],['⌘','帮我整理一个产品上线前的检查方案','general']].map(([icon,text,s])=>`<button class="example" data-example="${escape(text)}" data-type="${s}"><span class="icon">${icon}</span>${text}<span class="arrow">↗</span></button>`).join('')}</div></section><aside class="side-card"><span class="number">HOW IT WORKS</span><h2>把模糊，变成共识。</h2><p>AI 不知道的部分，先呈现给你。<br>你来选择，它才有清楚的方向。</p><div class="mini-flow"><div><span>01</span> 说出想法，不必面面俱到</div><div><span>02</span> 点选关键方向，补充你的偏好</div><div><span>03</span> 确认需求，交给开发工具执行</div></div><div class="note">当前是可交互的模板原型。原始表达会完整保留，但不会自动提取其中的需求。动态理解与选题引擎将在下一步接入。</div></aside></div>`;
++    return `<div class="eyebrow">FROM AN IDEA TO A SHARED UNDERSTANDING</div><h1>从你脑中的想法开始。</h1><p class="lead">不必先写一份完整需求。说出想法，再一起确认关键选择。</p><div class="grid"><section><form class="card" id="intent-form"><label class="input-label" for="intent">你想让 AI 帮你完成什么？</label><textarea class="intent-input" id="intent" maxlength="2000" required placeholder="比如：帮我做一个个人 AI 雅思网站……">${escape(state.intent)}</textarea><div class="label-row"><span class="hint">选择任务类型</span><small>原型暂不自动识别</small></div><div class="segments">${Object.entries(C.scenarios).map(([id,t])=>`<button type="button" class="segment ${scenario===id?'selected':''}" aria-pressed="${scenario===id}" data-scenario="${id}">${t.name}</button>`).join('')}</div><div class="actions"><span class="hint">${storage?'内容仅保存在当前浏览器':'当前浏览器无法保存，请及时导出'}</span><button class="primary" type="submit">开始梳理 <span>↗</span></button></div></form><div class="examples"><span class="examples-title">也可以从一个例子开始</span>${[['▧','帮我做一个个人 AI 雅思网站','website'],['✎','帮我写一篇介绍个人项目的文章','writing'],['⌘','帮我整理一个产品上线前的检查方案','general']].map(([icon,text,s])=>`<button class="example" data-example="${escape(text)}" data-type="${s}"><span class="icon">${icon}</span>${text}<span class="arrow">↗</span></button>`).join('')}</div></section><aside class="side-card"><span class="number">HOW IT WORKS</span><h2>把模糊，变成共识。</h2><p>AI 不知道的部分，先呈现给你。<br>你来选择，它才有清楚的方向。</p><div class="mini-flow"><div><span>01</span> 说出想法，不必面面俱到</div><div><span>02</span> 点选关键方向，补充你的偏好</div><div><span>03</span> 确认需求，交给开发工具执行</div></div><div class="note">当前使用规则识别部分原文信息，按缺口提出问题。候选需要你确认；复杂表达可能遗漏，尚未连接在线模型。</div></aside></div>`;
+   }
+ 
+   /* ── FACTS PANEL ── shows extracted facts with evidence and ambiguities */
+   function factsPanel() {
+-    const facts = state.facts || [];
+-    const ambs = state.ambiguities || [];
+-    if (!facts.length && !ambs.length) return '';
+-
+-    const coverage = C.coverageReport(state);
+-    let html = `<div class="facts-panel">`;
+-    html += `<div class="facts-header"><strong>从你的原文中识别到：</strong><span class="hint">（仅为候选，需你确认后才算已知）</span></div>`;
+-
+-    if (facts.length) {
+-      html += `<ul class="facts-list">`;
+-      for (const f of facts) {
+-        const qLabel = C.questions(state).find(q => q.id === f.field)?.title || f.field;
+-        html += `<li>${factBadge()} <strong>${escape(qLabel)}</strong>：${escape(f.value)}`;
+-        if (f.evidence) html += ` <span class="evidence">原文依据：${escape(f.evidence)}</span>`;
+-        html += `</li>`;
+-      }
+-      html += `</ul>`;
++    const coverage=C.coverageReport(state);
++    const active=C.questions(state);
++    let html=`<div class="facts-panel"><div class="facts-header"><strong>先核对我们读到的信息</strong><span class="hint">候选可直接确认，也可以纠正</span></div>`;
++    const facts=(state.facts || []).filter(f=>!(state.dismissedFacts || []).includes(f.id));
++    if(facts.length)html+='<ul class="facts-list">';
++    for(const f of facts) {
++      const a=state.answers[f.field], accepted=a?.status==='confirmed' && a.value===f.value;
++      const changed=a?.status==='confirmed' && a.value!==f.value;
++      html+=`<li class="fact-item"><div>${accepted?'<span class="badge">已采纳</span>':changed?'<span class="badge pending">未采纳此候选</span>':factBadge()} <strong>${escape(f.value)}</strong></div><div class="evidence">原文：${escape(f.evidence)}</div>`;
++      if(!accepted && active.some(q=>q.id===f.field))html+=`<div class="fact-actions"><button class="textbutton" data-fact="${f.id}">确认这个理解</button><button class="textbutton" data-dismiss="${f.id}">这个理解不对</button></div>`;
++      html+='</li>';
+     }
+-
+-    if (ambs.length) {
+-      html += `<ul class="ambs-list">`;
+-      for (const a of ambs) {
+-        html += `<li><span class="badge stale" style="margin-right:4px">待明确</span>${escape(a)}</li>`;
+-      }
+-      html += `</ul>`;
+-    }
+-
+-    if (!coverage.covered) {
+-      html += `<div class="notice">${escape(coverage.message)}</div>`;
+-    }
+-
+-    html += `</div>`;
++    if(facts.length)html+='</ul>';
++    for(const a of coverage.unresolved)html+=`<div class="hint">待明确：${escape(a)}</div>`;
++    html+=`<div class="coverage-note">${escape(coverage.message)}</div></div>`;
+     return html;
+   }
+ 
+@@ -82,10 +67,10 @@
+     return `<section class="question" id="question-${q.id}">
+ <h3>${escape(q.title)} ${q.required?'':'<span class="badge">可选</span>'}</h3>
+ <p>${escape(q.why)}</p>
+-${isFact ? `<div class="notice" style="margin-bottom:8px">📋 从原文识别到候选答案 <strong>${escape(a.value)}</strong>${a.evidence ? `（依据：${escape(a.evidence)}）` : ''}。请确认或修改。</div>` : ''}
++${isFact ? `<div class="notice" style="margin-bottom:8px"> 从原文识别到候选答案 <strong>${escape(a.value)}</strong>${a.evidence ? `（依据：${escape(a.evidence)}）` : ''}。请确认或修改。${a.factId?`<button class="textbutton" data-fact="${a.factId}">确认这个理解</button>`:""}</div>` : ''}
+ ${a?.status === 'stale' ? '<p class="notice">上游选择发生了变化，请重新选择或确认此项。</p>' : ''}
+ <div class="options">${q.options.map(v => `<button class="option ${isSelected(v)?'selected':''} ${isFactValue(v)?'fact-hint':''}" data-answer="${q.id}" data-value="${escape(v)}" aria-pressed="${isSelected(v)}"><span class="radio"></span>${escape(v)}${isFactValue(v)?' <span class="fact-tag">原文</span>':''}</button>`).join('')}<button class="option unknown ${a?.kind==='unknown'?'selected':''}" data-answer="${q.id}" data-kind="unknown" data-value="暂不确定"><span class="radio"></span>暂不确定，保留为待解决问题</button></div>
+-<form class="custom" data-custom="${q.id}"><input aria-label="${escape(q.title)} 自定义回答" maxlength="1000" placeholder="都不合适？写下自己的想法" value="${a?.kind==='custom'?escape(a.value):''}"><button type="submit">${a?.status==='stale'?'重新确认':'采用'}</button></form></section>`;
++<form class="custom" data-custom="${q.id}"><input aria-label="${escape(q.title)} 自定义回答" maxlength="2000" placeholder="都不合适？写下自己的想法" value="${escape(draftInputs[q.id] ?? (a?.kind==='custom'?a.value:''))}"><button type="submit">${a?.status==='stale'?'重新确认':'采用'}</button></form></section>`;
+   }
+ 
+   function summary() {
+@@ -95,7 +80,9 @@
+   /* ── CLARIFY — dynamic question flow, replaces fixed round*3 pagination ── */
+   function clarify() {
+     const allQs = C.questions(state);
+-    const nextQs = C.nextQuestions(state);
++    batchIds=batchIds.filter(id=>allQs.some(q=>q.id===id));
++    if(!batchIds.length)batchIds=C.nextQuestions(state).map(q=>q.id);
++    const nextQs = batchIds.map(id=>allQs.find(q=>q.id===id)).filter(Boolean);
+     const allDone = C.blockers(state).length === 0;
+     const confirmedCount = allQs.filter(q => state.answers[q.id]?.status === 'confirmed').length;
+     const totalCount = allQs.length;
+@@ -114,7 +101,7 @@
+     }
+ 
+     return `<div class="eyebrow">CLARIFY THE IMPORTANT PARTS</div><h1>让结果，更接近你的本意。</h1><p class="lead">每次最多显示三个最重要的问题。已有来源的选项会标注依据；你可以修改或确认。</p>
+-${factsPanel()}
++${state.migrationNotice?`<div class="notice">${escape(state.migrationNotice)}</div>`:""}${factsPanel()}
+ <div class="grid"><section class="card"><div class="section-meta"><span>${confirmedCount} / ${totalCount} 项已选择${nextQs.length > 0 ? ' · 当前显示优先级最高的问题' : ''}</span><div class="progress">${progressDots}</div></div>
+ ${questionsHtml}
+ <div class="actions"><button class="textbutton" id="previous">← 返回原始想法</button><button class="primary" id="next">${allDone ? '查看完整需求' : nextQs.length === 0 ? '查看完整需求' : '继续补充'} <span>→</span></button></div></section>${summary()}</div>`;
+@@ -123,7 +110,7 @@
+   function review() {
+     const pending = C.blockers(state), rows = C.rows(state);
+     const val = id => state.answers[id]?.status === 'confirmed' ? state.answers[id].value : '待确定';
+-    return `<div class="eyebrow">REVIEW BEFORE YOU BUILD</div><h1>这是你想要的结果吗？</h1><p class="lead">先核对范围，再把同一份需求交给 Bob 或其他执行工具。</p><div class="grid"><section class="card"><div class="summary-header"><h2>需求确认单</h2><span class="number">${state.activeRevision?'已确认 v'+state.activeRevision:'草稿 · 尚未整体确认'}</span></div><div class="original">${escape(state.intent)}</div><div class="preview"><strong>按当前选择，我理解你希望：</strong>为「${escape(val('audience'))}」完成「${escape(val('goal'))}」，本次交付为「${escape(val('delivery'))}」。<br>核心内容：${escape(val('detail'))}。<br>验收重点：${escape(val('success'))}。</div>${rows.map(r=>`<section class="review-row"><div class="reqtop"><small>${r.id}</small><h3>${escape(r.question)}</h3></div><p>${escape(r.value)}</p>${badge(r)} ${r.kind==='fact-candidate'?factBadge()+' ':''}  <small>来源：${r.kind==='custom'?'你的补充':r.kind==='selection'?'你的选择':r.kind==='fact-candidate'?'原文识别（待确认）':'尚未确认'}</small> · <button class="textbutton" data-edit="${r.field}">修改</button>${r.evidence?`<div class="evidence">原文依据：${escape(r.evidence)}</div>`:''}</section>`).join('')}<div class="${pending.length?'notice':'notice success'}">${pending.length?`还有 ${pending.length} 项关键问题需要确定，可以先导出草稿。`:state.activeRevision?'此版本已确认。后续修改会成为新草稿，历史版本仍保留。':'关键问题已回答。请对照原始想法检查是否遗漏，再确认此版本。'}</div><div class="actions"><button class="secondary" id="back">← 继续调整</button><button class="primary" id="confirm" ${pending.length||state.activeRevision?'disabled':''}>${state.activeRevision?'已确认 v'+state.activeRevision:'确认这就是我的需求'}</button></div></section><aside class="side-card summary"><span class="number">READY FOR HANDOFF</span><h2>带着共识，开始制作。</h2><p>导出文件包含原始想法、需求来源、范围与未决问题。开发工具能看到哪些内容已被确认。</p><div class="actions"><button class="primary" data-export="md">导出 ${state.activeRevision?'确认版':'草稿'} Markdown ↗</button><button class="secondary" data-export="json">导出结构化 JSON</button><button class="secondary" id="copy">复制开发交接内容</button></div><p class="note">此处导出需求，不会自动生成网站或发送给 Bob。下载后把 Markdown 放入项目，再让 Bob 读取。</p><div class="notice">实现状态：未验证<br>导出与确认不代表开发已经完成。</div>${state.history.length?`<details class="history"><summary>历史确认版本（${state.history.length}）</summary>${state.history.map((h,i)=>`<button class="textbutton" data-history="${i}">下载 v${i+1}（${h.confirmedAt?.slice(0,10)||''}）</button>`).join('')}</details>`:''}</aside></div>`;
++    return `<div class="eyebrow">REVIEW BEFORE YOU BUILD</div><h1>这是你想要的结果吗？</h1><p class="lead">先核对范围，再把同一份需求交给 Bob 或其他执行工具。</p><div class="grid"><section class="card"><div class="summary-header"><h2>需求确认单</h2><span class="number">${state.activeRevision?'已确认 v'+state.activeRevision:'草稿 · 尚未整体确认'}</span></div><div class="original">${escape(state.intent)}</div><div class="coverage-note">${escape(C.coverageReport(state).message)}</div><div class="preview"><strong>按当前选择，我理解你希望：</strong>为「${escape(val('audience'))}」完成「${escape(val('goal'))}」，本次交付为「${escape(val('delivery'))}」。<br>核心内容：${escape(val('detail'))}。<br>验收重点：${escape(val('success'))}。</div>${rows.map(r=>`<section class="review-row"><div class="reqtop"><small>${r.id}</small><h3>${escape(r.question)}</h3></div><p>${escape(r.value)}</p>${badge(r)} ${r.kind==='fact-candidate'?factBadge()+' ':''}  <small>来源：${r.kind==='custom'?'你的补充':r.kind==='selection'?'你的选择':r.kind==='fact-confirmed'?'原文候选，经你确认':r.kind==='fact-candidate'?'原文识别（待确认）':'尚未确认'}</small> · <button class="textbutton" data-edit="${r.field}">修改</button>${r.evidence?`<div class="evidence">原文依据：${escape(r.evidence)}</div>`:''}</section>`).join('')}<div class="${pending.length?'notice':'notice success'}">${pending.length?`还有 ${pending.length} 项关键问题需要确定，可以先导出草稿。`:state.activeRevision?'此版本已确认。后续修改会成为新草稿，历史版本仍保留。':'关键问题已回答。请对照原始想法检查是否遗漏，再确认此版本。'}</div><div class="actions"><button class="secondary" id="back">← 继续调整</button><button class="primary" id="confirm" ${pending.length||state.activeRevision?'disabled':''}>${state.activeRevision?'已确认 v'+state.activeRevision:'确认这就是我的需求'}</button></div></section><aside class="side-card summary"><span class="number">READY FOR HANDOFF</span><h2>带着共识，开始制作。</h2><p>导出文件包含原始想法、需求来源、范围与未决问题。开发工具能看到哪些内容已被确认。</p><div class="actions"><button class="primary" data-export="md">导出 ${state.activeRevision?'确认版':'草稿'} Markdown ↗</button><button class="secondary" data-export="json">导出结构化 JSON</button><button class="secondary" id="copy">复制开发交接内容</button></div><p class="note">此处导出需求，不会自动生成网站或发送给 Bob。下载后把 Markdown 放入项目，再让 Bob 读取。</p><div class="notice">实现状态：未验证<br>导出与确认不代表开发已经完成。</div>${state.history.length?`<details class="history"><summary>历史确认版本（${state.history.length}）</summary>${state.history.map((h,i)=>`<button class="textbutton" data-history="${i}">下载 v${i+1}（${escape(h.confirmedAt?.slice(0,10)||'')}）</button>`).join('')}</details>`:''}</aside></div>`;
+   }
+ 
+   function download(text, filename, type) {
+@@ -146,7 +133,7 @@
+         const text=$('#intent').value.trim();
+         if(text!==state.intent||scenario!==state.scenario){
+           if(state.intent&&!window.confirm('更换原始想法或任务类型会新建项目。请先导出需要保留的版本。继续吗？'))return;
+-          state=C.start(text,scenario);
++          state=C.start(text,scenario);batchIds=[];draftInputs={};
+           // Apply extracted facts as pre-filled pending answers
+           state=C.applyFacts(state);
+         }
+@@ -155,13 +142,19 @@
+     });
+     document.querySelectorAll('[data-answer]').forEach(b=>b.onclick=()=>change(b.dataset.answer,b.dataset.value,b.dataset.kind||'selection'));
+     document.querySelectorAll('[data-custom]').forEach(f=>f.onsubmit=e=>{e.preventDefault();change(f.dataset.custom,f.querySelector('input').value,'custom');});
+-    document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>{go(1);requestAnimationFrame(()=>{const el=$('#question-'+b.dataset.edit);el?.scrollIntoView({block:'center'});el?.querySelector('button')?.focus({preventScroll:true});});});
++    document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>{
++      batchIds=[b.dataset.edit,...C.nextQuestions(state).map(q=>q.id).filter(id=>id!==b.dataset.edit)].slice(0,3);
++      delete draftInputs[b.dataset.edit];
++      go(1);requestAnimationFrame(()=>{const el=$('#question-'+b.dataset.edit);el?.scrollIntoView({block:'center'});el?.querySelector('button')?.focus({preventScroll:true});});
++    });
++    document.querySelectorAll('[data-fact]').forEach(b=>b.onclick=()=>{try{state=C.confirmFact(state,b.dataset.fact);persist();render();}catch(e){notify(e.message);}});
++    document.querySelectorAll('[data-dismiss]').forEach(b=>b.onclick=()=>{try{state=C.dismissFact(state,b.dataset.dismiss);persist();render();}catch(e){notify(e.message);}});
+     // Dynamic navigation: "next" just goes to review when all done, else re-renders same step to show next batch
+     if($('#next'))$('#next').onclick=()=>{
+       const allDone = C.blockers(state).length === 0;
+       const nextQs = C.nextQuestions(state);
+       if(allDone || nextQs.length === 0){ go(2); }
+-      else { render(); window.scrollTo(0,0); }
++      else { batchIds=[];render(); window.scrollTo(0,0); }
+     };
+     if($('#previous'))$('#previous').onclick=()=>go(0);
+     if($('#back'))$('#back').onclick=()=>go(1);
+@@ -169,7 +162,7 @@
+     document.querySelectorAll('[data-export]').forEach(b=>b.onclick=()=>{const spec=C.specification(state),json=b.dataset.export==='json';download(json?JSON.stringify(spec,null,2):C.markdown(spec),'intentconfirm-'+(state.activeRevision?'v'+state.activeRevision:'draft')+(json?'.json':'.md'),json?'application/json':'text/markdown;charset=utf-8');});
+     document.querySelectorAll('[data-history]').forEach(b=>b.onclick=()=>{const n=+b.dataset.history;download(JSON.stringify(state.history[n],null,2),'intentconfirm-history-v'+(n+1)+'.json','application/json');});
+     if($('#copy'))$('#copy').onclick=async()=>{try{await navigator.clipboard.writeText(C.markdown(C.specification(state)));notify('交接内容已复制。');}catch{notify('当前环境不支持复制，请使用 Markdown 导出。');}};
+-    $('#reset').onclick=()=>{if(window.confirm('清除当前项目和本地版本记录？请先导出需要保留的文件。')){state=C.fresh();scenario='website';persist();go(0);}};
++    $('#reset').onclick=()=>{if(window.confirm('清除当前项目和本地版本记录？请先导出需要保留的文件。')){state=C.fresh();scenario='website';batchIds=[];draftInputs={};persist();go(0);}};
+   }
+ 
+   render();
+--- a/src/style.css
++++ b/src/style.css
+@@ -9,3 +9,11 @@
+ .option.fact-hint{border-color:#7abce0;background:#f0f8ff}
+ .fact-tag{font-size:10px;background:#7abce0;color:#fff;border-radius:3px;padding:1px 4px;margin-left:4px;vertical-align:middle}
+ .review-row .evidence{display:block;margin-top:4px;font-size:12px;color:#1a6896;font-style:italic}
++
++/* Codex review: bounded mobile layout and actionable evidence cards. */
++.fact-item{padding:10px 0;border-bottom:1px solid #d5e5ed;display:block!important;overflow-wrap:anywhere}
++.fact-item>div{margin:4px 0}.fact-actions{display:flex;gap:18px;flex-wrap:wrap}.facts-header .hint{display:block;margin-top:4px}
++.coverage-note{font-size:12px;line-height:1.8;color:#667c71;margin-top:12px;overflow-wrap:anywhere}.evidence{overflow-wrap:anywhere}
++.progress{flex-wrap:wrap;justify-content:flex-end;max-width:45%}.progress i{width:17px}.section-meta{gap:12px}.reqtop{flex-wrap:wrap}
++.review-row .reqtop h3{min-width:0}.notice .textbutton{display:block;margin-top:8px}.fact-item .textbutton{min-height:30px}
++@media(max-width:580px){.eyebrow{font-size:9px;letter-spacing:1px}.facts-panel{padding:13px}.progress i{width:11px}.section-meta{align-items:flex-start}.custom{flex-wrap:wrap}.custom input{flex:1;min-width:150px}.review-row .reqtop{flex-wrap:wrap}}
+--- a/index.html
++++ b/index.html
+@@ -1,6 +1,6 @@
+ <!doctype html>
+ <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>IntentConfirm · 让想法先对齐</title><link rel="stylesheet" href="src/style.css"></head>
+ <body><div class="app-shell">
+-<aside class="rail"><a class="brand" href="index.html" aria-label="IntentConfirm 首页"><span class="brand-icon">i<span>✓</span></span><span>Intent<span class="muted-brand">Confirm</span></span></a><div class="rail-title">你的想法，逐步清晰</div><nav aria-label="工作流程"><button data-step="0"><b>01</b> 描述想法 <span>→</span></button><button data-step="1"><b>02</b> 补齐关键信息 <span>→</span></button><button data-step="2"><b>03</b> 确认与交接 <span>→</span></button></nav><div class="rail-note"><span class="spark">✳</span><p>少一点猜测。<br>更接近你的本意。</p><small>先确认方向，再投入制作。</small></div><footer><span class="dot"></span> 本地原型 · v0.1<br><button id="reset" class="reset">清除当前项目</button></footer></aside>
+-<div class="workspace"><header><div>WORKSPACE <span>/</span> 新的想法</div><span class="mode">模板模式 · 未连接模型</span></header><main id="main"></main><div id="toast" role="status" aria-live="polite"></div></div>
++<aside class="rail"><a class="brand" href="index.html" aria-label="IntentConfirm 首页"><span class="brand-icon">i<span>✓</span></span><span>Intent<span class="muted-brand">Confirm</span></span></a><div class="rail-title">你的想法，逐步清晰</div><nav aria-label="工作流程"><button data-step="0"><b>01</b> 描述想法 <span>→</span></button><button data-step="1"><b>02</b> 补齐关键信息 <span>→</span></button><button data-step="2"><b>03</b> 确认与交接 <span>→</span></button></nav><div class="rail-note"><span class="spark">✳</span><p>少一点猜测。<br>更接近你的本意。</p><small>先确认方向，再投入制作。</small></div><footer><span class="dot"></span> 本地原型 · v0.2<br><button id="reset" class="reset">清除当前项目</button></footer></aside>
++<div class="workspace"><header><div>WORKSPACE <span>/</span> 新的想法</div><span class="mode">规则模式 · 未连接模型</span></header><main id="main"></main><div id="toast" role="status" aria-live="polite"></div></div>
+ </div><script src="src/core.js"></script><script src="src/app.js"></script></body></html>
+--- a/tests/core.test.cjs
++++ b/tests/core.test.cjs
+@@ -49,6 +49,8 @@
+   let s=C.confirm(filled());
+   s=C.setAnswer(s,'goal','展示作品或业务');
+   s=C.setAnswer(s,'detail','作品展示与分类');
++  assert.equal(s.answers.ai_role.status,'stale');
++  s=C.setAnswer(s,'ai_role',s.answers.ai_role.value);
+   s=C.setAnswer(s,'success',s.answers.success.value);
+   s=C.confirm(s);
+   assert.equal(s.activeRevision,2);
+@@ -70,7 +72,8 @@
+     assert.ok(md.includes(r.value));
+     assert.ok(md.includes(r.kind));
+   }
+-  assert.ok(md.includes('不做登录与支付'));
++  assert.ok(md.includes('不要登录'));
++  assert.ok(!md.includes('支付'));
+   assert.equal(spec.verification,'not-run');
+ });
+ 
+@@ -124,7 +127,7 @@
+ 
+   const excludeFact=s.facts.find(f=>f.field==='exclude');
+   assert.ok(excludeFact,'exclude (no-login) fact should be extracted');
+-  assert.equal(excludeFact.value,'不做登录与支付');
++  assert.equal(excludeFact.value,'不要登录');
+   assert.ok(excludeFact.evidence,'exclude fact should have evidence');
+ 
+   const detailFact=s.facts.find(f=>f.field==='detail');
+@@ -135,7 +138,7 @@
+   const s2=C.applyFacts(s);
+   assert.equal(s2.answers.exclude?.kind,'fact-candidate');
+   assert.equal(s2.answers.exclude?.status,'pending');
+-  assert.equal(s2.answers.exclude?.value,'不做登录与支付');
++  assert.equal(s2.answers.exclude?.value,'不要登录');
+ 
+   // nextQuestions should NOT include 'exclude' since it's pre-filled as pending
+   // (pending shows in questions but the fact is visible)
+@@ -171,10 +174,11 @@
+     s2=C.setAnswer(s2,q.id,q.options[0]);
+   }
+   assert.throws(()=>C.confirm(s2),'should not confirm without ai_role');
+-  // After answering ai_role, ai_role question disappears and confirm works
++  // Confirmed AI role stays in the catalogue and export, but not the next-question queue
+   s2=C.setAnswer(s2,'ai_role','AI 生成或批改内容');
+-  // Now ai_role should no longer appear in questions
+-  assert.ok(!C.questions(s2).some(q=>q.id==='ai_role'),'ai_role should be gone after answering');
++  assert.ok(C.questions(s2).some(q=>q.id==='ai_role'),'ai_role must remain editable');
++  assert.ok(!C.nextQuestions(s2).some(q=>q.id==='ai_role'),'confirmed role should not repeat');
++  assert.ok(C.rows(s2).some(r=>r.field==='ai_role' && r.status==='confirmed'));
+   assert.doesNotThrow(()=>C.confirm(s2));
+ });
+ 
+@@ -270,7 +274,7 @@
+   assert.ok(Array.isArray(spec.extractedFacts),'extractedFacts should be array');
+   assert.ok(Array.isArray(spec.ambiguities),'ambiguities should be array');
+   assert.ok(spec.ambiguities.some(a=>a.includes('AI')),'AI ambiguity should be in spec');
+-  assert.equal(spec.engine,'rule-baseline-v2');
++  assert.equal(spec.engine,'rule-baseline-v3-reviewed');
+ });
+ 
+ // Acceptance: markdown includes evidence section and extracted facts
+@@ -279,7 +283,8 @@
+   const spec=C.specification(s);
+   const md=C.markdown(spec);
+   assert.ok(md.includes('从原文识别的事实候选'),'markdown should have facts section');
+-  assert.ok(md.includes('不做登录与支付'),'markdown should mention the no-login fact');
++  assert.ok(md.includes('不要登录'),'markdown should mention exact no-login fact');
++  assert.ok(!md.includes('支付'),'must not add payment exclusion');
+   assert.ok(md.includes('原文依据'),'markdown should include evidence label');
+ });
+ 
+@@ -297,7 +302,7 @@
+   s=C.setAnswer(s,'audience','我自己');
+   s=C.setAnswer(s,'goal','学习与练习');
+   s=C.setAnswer(s,'delivery','自己实际使用');
+-  s=C.setAnswer(s,'detail','练习与反馈');
++  s=C.setAnswer(s,'detail','口语练习与反馈');
+   s=C.setAnswer(s,'exclude','不做登录与支付');
+   s=C.setAnswer(s,'success','用户能独立完成核心操作');
+   // Now change goal
+@@ -322,7 +327,7 @@
+   // speaking
+   let s=C.start('雅思练习','website');
+   s=C.setAnswer(s,'goal','学习与练习');
+-  s=C.setAnswer(s,'detail','练习与反馈');
++  s=C.setAnswer(s,'detail','口语练习与反馈');
+   const qs=C.questions(s);
+   assert.ok(qs.some(q=>q.id==='speaking_input'),'speaking_input should appear for 练习与反馈');
+ 
+@@ -335,3 +340,76 @@
+   // These should not appear in the other scenario
+   assert.ok(!qs.some(q=>q.id==='portfolio_content'),'portfolio_content should NOT appear for learning goal');
+ });
++
++/* Codex audit regressions: failures observed in the uploaded Bob baseline. */
++test('unknown AI role remains a blocker and can be edited later',()=>{
++ let s=C.start('个人 AI 雅思网站','website');
++ s=C.setAnswer(s,'ai_role','暂不确定','unknown');
++ for(const q of C.questions(s).filter(q=>q.id!=='ai_role'))s=C.setAnswer(s,q.id,q.id==='detail'?'学习记录与进度':q.options[0]);
++ assert.ok(C.blockers(s).some(q=>q.id==='ai_role'));assert.throws(()=>C.confirm(s));
++ s=C.setAnswer(s,'ai_role','AI 个性化推荐');assert.ok(C.questions(s).some(q=>q.id==='ai_role'));
++ assert.ok(C.markdown(C.specification(s)).includes('AI 个性化推荐'));
++});
++test('uncertainty cannot be confirmed even when submitted as a normal option',()=>{
++ let s=C.start('雅思口语练习网站','website');s=C.setAnswer(s,'detail','口语练习与反馈');
++ s=C.setAnswer(s,'speaking_input','暂不确定');assert.equal(s.answers.speaking_input.status,'pending');
++ assert.ok(C.blockers(s).some(q=>q.id==='speaking_input'));
++});
++test('writing practice never asks for recording; switching back requires reconfirmation',()=>{
++ let s=C.start('雅思作文练习网站','website');s=C.setAnswer(s,'detail','作文练习与反馈');
++ assert.ok(!C.questions(s).some(q=>q.id==='speaking_input'));
++ s=C.setAnswer(s,'detail','口语练习与反馈');s=C.setAnswer(s,'speaking_input','实时麦克风录音');
++ s=C.setAnswer(s,'detail','作文练习与反馈');assert.equal(s.answers.speaking_input.status,'stale');
++ assert.ok(!C.rows(s).some(r=>r.field==='speaking_input'));
++ s=C.setAnswer(s,'detail','口语练习与反馈');assert.ok(C.blockers(s).some(q=>q.id==='speaking_input'));
++});
++test('switching an upstream answer to unknown also invalidates dependents',()=>{
++ let s=filled();s=C.setAnswer(s,'goal','暂不确定','unknown');
++ assert.equal(s.answers.detail.status,'stale');assert.equal(s.answers.success.status,'stale');
++ assert.equal(s.answers.audience.status,'confirmed');
++});
++test('fact confirmation preserves evidence and rejected candidates cannot auto-apply',()=>{
++ let s=C.applyFacts(C.start('给自己用的网站，不要登录','website'));
++ const f=s.facts.find(f=>f.field==='exclude');s=C.confirmFact(s,f.id);
++ assert.equal(s.answers.exclude.kind,'fact-confirmed');assert.equal(s.answers.exclude.evidence,'不要登录');
++ assert.ok(C.markdown(C.specification(s)).includes('原文：不要登录'));
++ const a=s.facts.find(f=>f.field==='audience');s=C.dismissFact(s,a.id);s=C.applyFacts(s);
++ assert.equal(s.answers.audience,undefined);assert.throws(()=>C.confirmFact(s,a.id));
++ assert.equal(C.specification(s).extractedFacts.find(f=>f.id===a.id).decision,'dismissed');
++});
++test('negative wording and writing scenario do not create positive website goals',()=>{
++ const a=C.extract('不要作品展示，也不要口语功能','website');
++ assert.ok(!a.facts.some(f=>f.field==='goal'||f.field==='detail'));
++ const b=C.extract('写一篇展示自己作品的文章','writing');assert.ok(!b.facts.some(f=>f.value==='展示作品或业务'));
++ assert.ok(!C.extract('个人作品集网站','website').facts.some(f=>f.field==='audience'));
++});
++test('multiple candidate goals are not silently resolved by first-match order',()=>{
++ let s=C.applyFacts(C.start('做一个雅思练习网站，同时展示作品','website'));
++ assert.equal(s.facts.filter(f=>f.field==='goal').length,2);
++ assert.equal(s.answers.goal,undefined);assert.ok(C.coverageReport(s).unresolved.some(a=>a.includes('goal')));
++});
++test('budget and time remain literal candidates; any extraction is only partial coverage',()=>{
++ const s=C.applyFacts(C.start('给自己用的网站，预算3000元，两周内完成，不要登录','website'));
++ assert.ok(s.answers.constraints.value.includes('3000元'));assert.ok(s.answers.constraints.value.includes('两周内完成'));
++ assert.equal(C.coverageReport(s).level,'partial');assert.ok(C.blockers(s).some(q=>q.id==='constraints'));
++ assert.equal(C.coverageReport(C.start('make a personal app','website')).level,'unknown');
++});
++test('unknown high-priority questions do not starve all other questions',()=>{
++ let s=C.start('AI 网站','website');for(const id of ['audience','goal','ai_role'])s=C.setAnswer(s,id,'暂不确定','unknown');
++ assert.ok(C.nextQuestions(s).some(q=>q.id==='delivery'));assert.ok(C.blockers(s).some(q=>q.id==='ai_role'));
++});
++test('context changes cannot renumber stable requirement IDs',()=>{
++ let s=C.start('网站','website');s=C.setAnswer(s,'goal','展示作品或业务');
++ const portfolioId=C.rows(s).find(r=>r.field==='portfolio_content').id;
++ s=C.setAnswer(s,'detail','AI 介绍作品','custom');
++ assert.equal(C.rows(s).find(r=>r.field==='portfolio_content').id,portfolioId);
++});
++test('legacy stored sessions preserve history but reopen answers for review',()=>{
++ const s=C.confirm(filled());const old=JSON.parse(JSON.stringify(s));delete old.engineRevision;
++ const n=C.restore(JSON.stringify(old));assert.equal(n.activeRevision,null);assert.equal(n.engineRevision,3);
++ assert.equal(n.answers.goal.status,'stale');assert.deepEqual(n.history,old.history);assert.ok(n.migrationNotice);
++});
++test('malformed persisted facts cannot crash the interface',()=>{
++ let s=C.start('网站','website');s.facts=[null];assert.deepEqual(C.restore(JSON.stringify(s)),C.fresh());
++ s=C.start('网站','website');s.ambiguities=[null];assert.deepEqual(C.restore(JSON.stringify(s)),C.fresh());
++});

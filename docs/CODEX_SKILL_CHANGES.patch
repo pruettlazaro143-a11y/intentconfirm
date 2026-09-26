@@ -1,0 +1,601 @@
+--- a/.bob/skills/intentconfirm/SKILL.md
++++ b/.bob/skills/intentconfirm/SKILL.md
+@@ -63,6 +63,6 @@
+ 
+ The base workflow needs only the ability to read instructions and converse. Native discovery, choice widgets, file access, and script execution depend on the host. With a text-only client, supply these instructions as context and use text choices; do not promise automatic invocation, persistent memory, enforceable gates, or universal compatibility.
+ 
+-For difficult interaction cases, read [interaction patterns](references/interaction-patterns.md). For longer projects or requested structured handoffs, read [record format](references/record-format.md) and optionally use `scripts/check_brief.py` with Python 3.9+. The checker makes no network calls and does not choose the model. If scripts are unavailable, keep a compact textual record and disclose that programmatic checks were not run. Do not create files unless useful for the task; follow the host's normal file-storage rules.
++For difficult interaction cases, read [interaction patterns](references/interaction-patterns.md). For longer projects or requested structured handoffs, read [record format](references/record-format.md) and optionally use `scripts/check_brief.py` with Python 3.9+. For revisions to an existing structured record, use `scripts/update_brief.py` as described there: add the new user turn with the patch, retain its evidence, invalidate affected acceptance, and write a new draft without overwriting the old record. The checker makes no network calls and does not choose the model. If scripts are unavailable, keep a compact textual record and disclose that programmatic checks were not run. Do not create files unless useful for the task; follow the host's normal file-storage rules.
+ 
+ Treat the checker as structural assistance, not a security boundary against the same agent that writes its input. A quote's presence does not prove semantic correctness or authenticate a user message. Never invent confirmation evidence to make a check pass. Keep private task records separate from this reusable skill; never add actual conversations or credentials to a public skill distribution.
+--- a/.bob/skills/intentconfirm/scripts/test_update_regressions.py
++++ b/.bob/skills/intentconfirm/scripts/test_update_regressions.py
+@@ -0,0 +1,107 @@
++"""Codex regressions for the uploaded Bob updater. No real-model assertions."""
++import copy
++import json
++import os
++import pathlib
++import subprocess
++import sys
++import tempfile
++import unittest
++from test_update_brief import chain_record, with_approval
++from update_brief import apply_patches
++
++
++def patch(iid="goal", value="作文练习", source="u3"):
++    return {"id": iid, "field": "value", "new_value": value,
++            "evidence": {"source": source, "quote": "改成作文练习"}}
++
++
++class RegressionTests(unittest.TestCase):
++    def test_changed_root_drops_old_consent_and_retains_current_source(self):
++        old = chain_record(); new = apply_patches(old, [patch()]); root = new["items"][0]
++        self.assertEqual(root["status"], "candidate")
++        self.assertNotIn("confirmation", root)
++        self.assertEqual(root["evidence"], [patch()["evidence"]])
++        self.assertEqual(new["change_log"][0]["previous_items"]["goal"], old["items"][0])
++
++    def test_two_changed_roots_never_keep_old_confirmation(self):
++        changes = [patch(), patch("detail", "作文反馈")]
++        new = apply_patches(chain_record(), changes)
++        self.assertEqual([i["status"] for i in new["items"][:3]], ["candidate", "candidate", "stale"])
++        for i in new["items"][:3]: self.assertNotIn("confirmation", i)
++        self.assertEqual(new, apply_patches(chain_record(), changes))
++        reversed_new = apply_patches(chain_record(), list(reversed(changes)))
++        self.assertEqual(new["items"], reversed_new["items"])
++
++    def test_new_user_turn_can_be_added_without_editing_old_record(self):
++        old = chain_record(); old["sources"] = old["sources"][:2]; snap = copy.deepcopy(old)
++        new = apply_patches(old, [patch(source="u_new")], [{"id": "u_new", "role": "user", "text": "改成作文练习"}])
++        self.assertEqual(old, snap)
++        self.assertEqual(new["items"][0]["evidence"][0]["source"], "u_new")
++        self.assertEqual(len(new["sources"]), 3)
++
++    def test_old_sources_cannot_be_overwritten(self):
++        with self.assertRaises(ValueError):
++            apply_patches(chain_record(), [patch()], [{"id": "u1", "role": "user", "text": "改成作文练习"}])
++
++    def test_invalid_input_is_rejected_before_patch_can_repair_it(self):
++        old = chain_record(); old["items"][0]["status"] = "broken"
++        p = patch(); p.update(field="status", new_value="candidate")
++        with self.assertRaises(ValueError): apply_patches(old, [p])
++
++    def test_status_patch_cannot_reuse_old_confirmation_to_accept_new_value(self):
++        p = patch(); p.update(field="status", new_value="confirmed")
++        with self.assertRaises(ValueError): apply_patches(chain_record(), [patch(), p])
++
++    def test_duplicate_conflicting_field_patches_fail_atomically(self):
++        old = chain_record(); snap = copy.deepcopy(old)
++        with self.assertRaises(ValueError): apply_patches(old, [patch(), patch(value="另一个目标")])
++        self.assertEqual(old, snap)
++
++    def test_malformed_patch_batch_fails_without_mutation(self):
++        old = chain_record(); snap = copy.deepcopy(old)
++        for patches in [None, {}, [patch(), {"id": "missing"}]]:
++            with self.assertRaises(ValueError): apply_patches(old, patches)
++        self.assertEqual(old, snap)
++
++    def test_stale_propagates_through_unknown_middle_item(self):
++        old = chain_record(); old["items"][1]["status"] = "unknown"
++        new = apply_patches(old, [patch()])
++        self.assertEqual(new["items"][1]["status"], "unknown")
++        self.assertEqual(new["items"][2]["status"], "stale")
++
++    def test_cycle_and_missing_dependency_cannot_be_ignored(self):
++        for deps in [["success"], ["missing"]]:
++            old = chain_record(); old["items"][0]["depends_on"] = deps
++            with self.assertRaises(ValueError): apply_patches(old, [patch()])
++
++    def test_empty_batch_preserves_approval(self):
++        old = with_approval(chain_record())
++        self.assertEqual(apply_patches(old, []), old)
++
++    def test_cli_accepts_new_turn_envelope(self):
++        script = pathlib.Path(__file__).with_name("update_brief.py")
++        with tempfile.TemporaryDirectory() as tmp:
++            old, changes, out = [pathlib.Path(tmp)/n for n in ["old.json", "changes.json", "new.json"]]
++            r = chain_record(); r["sources"] = r["sources"][:2]; old.write_text(json.dumps(r))
++            changes.write_text(json.dumps({"sources": [{"id": "u_new", "role": "user", "text": "改成作文练习"}], "patches": [patch(source="u_new")]}))
++            result = subprocess.run([sys.executable, str(script), str(old), str(changes), str(out)], capture_output=True, text=True)
++            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++            self.assertEqual(json.loads(out.read_text())["items"][0]["status"], "candidate")
++            self.assertEqual(json.loads(old.read_text()), r)
++
++    def test_cli_cannot_overwrite_input_through_file_aliases(self):
++        script = pathlib.Path(__file__).with_name("update_brief.py")
++        with tempfile.TemporaryDirectory() as tmp:
++            old = pathlib.Path(tmp)/"old.json"; original = json.dumps(chain_record()); old.write_text(original)
++            hard, sym = pathlib.Path(tmp)/"hard.json", pathlib.Path(tmp)/"sym.json"
++            os.link(old, hard); sym.symlink_to(old)
++            for out in [old, hard, sym]:
++                for flags in [[], ["--force"]]:
++                    r = subprocess.run([sys.executable, str(script), str(old), json.dumps([patch()]), str(out)] + flags, capture_output=True, text=True)
++                    self.assertEqual(r.returncode, 2)
++                    self.assertEqual(old.read_text(), original)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/.bob/skills/intentconfirm/scripts/update_brief.py
++++ b/.bob/skills/intentconfirm/scripts/update_brief.py
+@@ -1,174 +1,172 @@
+ #!/usr/bin/env python3
+-"""Offline brief-update tool — applies user-evidenced changes and propagates stale status.
++"""Offline draft update: preserve evidence, invalidate acceptance, never overwrite files.
+ 
+-Reads an existing JSON brief (never modifies it) and a JSON patch list supplied on the
+-command line.  Writes the updated draft to a new output file.  Never overwrites the input
+-file, never touches historical snapshots, never contacts any network service.
+-
+-Exit codes:
+-  0  Output written and structurally valid.
+-  2  Input or patch is malformed; output not written.
++CLI: update_brief.py old.json changes.json new.json
++Changes: a patch list, or {"sources": [...new user turns...], "patches": [...]}.
++No model, network or semantic-consent verification. Exit 0 on success; 2 on failure.
+ """
+ import argparse
+ import copy
+ import json
++import os
+ import sys
+ from pathlib import Path
+ 
+-# Re-use the existing checker to validate both input and output.
+-# resolve relative to this script's directory so the tool works from any cwd.
+-_HERE = Path(__file__).parent
+-sys.path.insert(0, str(_HERE))
+-from check_brief import inspect as _inspect, require, text, ACTIVE, ID  # noqa: E402
+-
+-
+-# ---------------------------------------------------------------------------
+-# Patch schema
+-# ---------------------------------------------------------------------------
+-# A patch list is a JSON array of objects, each with:
+-#   id         (str)   — ID of the item to change.
+-#   field      (str)   — one of: "value", "label", "status", "critical", "kind".
+-#   new_value  (any)   — the new value for the field.
+-#   evidence   (obj)   — {"source": "<sid>", "quote": "<exact text>"} pointing to a
+-#                        user-role source in the record that backs this change.
+-#                        Required for every patch; the source must already exist in the
+-#                        record and must have role "user".
+-# ---------------------------------------------------------------------------
++from check_brief import inspect as _inspect, require, text, ACTIVE, ID, STATUSES
+ 
+ _PATCHABLE_FIELDS = {"value", "label", "status", "critical", "kind"}
++MAX_BYTES = 2_000_000
+ 
+ 
+ def _validate_patch_entry(entry, source_map):
+-    """Validate a single patch entry against the known sources.  Raises ValueError."""
+     require(isinstance(entry, dict), "each patch entry must be an object")
+-    iid = entry.get("id")
+-    require(isinstance(iid, str) and ID.fullmatch(iid), f"patch entry has invalid id: {iid!r}")
+-    field = entry.get("field")
+-    require(field in _PATCHABLE_FIELDS, f"patch field must be one of {sorted(_PATCHABLE_FIELDS)}, got {field!r}")
+-    require("new_value" in entry, "patch entry missing new_value")
++    iid, field = entry.get("id"), entry.get("field")
++    require(isinstance(iid, str) and ID.fullmatch(iid), "invalid patch item id")
++    require(isinstance(field, str) and field in _PATCHABLE_FIELDS, "invalid patch field")
++    require("new_value" in entry, "missing new_value")
++    v = entry["new_value"]
++    if field in {"value", "label"}:
++        require(text(v), "value/label must be nonempty text")
++    elif field == "critical":
++        require(type(v) is bool, "critical must be boolean")
++    elif field == "kind":
++        require(isinstance(v, str) and v in {"requirement", "exclusion", "assumption"}, "invalid kind")
++    else:
++        require(isinstance(v, str) and v in STATUSES - ACTIVE,
++                "update tool cannot set stated/confirmed; record genuine adoption separately")
+     ev = entry.get("evidence")
+     require(isinstance(ev, dict), "patch evidence must be an object")
+-    sid = ev.get("source")
+-    quote = ev.get("quote")
+-    require(isinstance(sid, str) and sid in source_map, f"patch evidence source {sid!r} not found in record")
+-    require(source_map[sid]["role"] == "user", f"patch evidence source {sid!r} must have role 'user'")
+-    require(text(quote), "patch evidence quote must be a non-empty string")
+-    require(quote in source_map[sid]["text"], f"patch evidence quote not found in source {sid!r}")
++    sid, quote = ev.get("source"), ev.get("quote")
++    require(isinstance(sid, str) and sid in source_map, "patch source missing; provide new user turns in sources")
++    require(source_map[sid]["role"] == "user", "patch source must be a user turn")
++    require(text(quote) and quote in source_map[sid]["text"], "patch quote does not exist in user source")
+ 
+ 
+-def _build_dep_children(item_map):
+-    """Return {parent_id: [child_id, ...]} (direct dependents only)."""
++def _descendants(roots, item_map):
+     children = {iid: [] for iid in item_map}
+     for iid, item in item_map.items():
+         for dep in item["depends_on"]:
+-            if dep in children:
+-                children[dep].append(iid)
+-    return children
++            children[dep].append(iid)
++    # Separate traversed nodes from found descendants: a node may be both a
++    # batch-change root and another root's descendant.
++    pending, traversed, found = list(roots), set(), set()
++    while pending:
++        current = pending.pop()
++        if current in traversed:
++            continue
++        traversed.add(current)
++        for child in children[current]:
++            found.add(child)
++            pending.append(child)
++    return found
+ 
+ 
+-def _transitive_stale(changed_ids, item_map):
+-    """BFS: collect all descendant IDs of changed_ids that are currently ACTIVE."""
+-    children = _build_dep_children(item_map)
+-    to_mark = set()
+-    queue = list(changed_ids)
+-    seen = set(changed_ids)
+-    while queue:
+-        cur = queue.pop()
+-        for child in children.get(cur, []):
+-            if child not in seen:
+-                seen.add(child)
+-                queue.append(child)
+-                if item_map[child]["status"] in ACTIVE:
+-                    to_mark.add(child)
+-    return to_mark
++def apply_patches(record, patches, new_sources=None):
++    """Return a validated copy; every semantic edit needs new review, never old consent."""
++    parent = _inspect(record)  # Reject invalid input before permitting any repairs.
++    require(isinstance(patches, list) and len(patches) <= 200, "patches must be an array, max 200")
++    new_sources = [] if new_sources is None else new_sources
++    require(isinstance(new_sources, list) and len(new_sources) <= 100, "sources must be an array, max 100")
++    draft = copy.deepcopy(record)
++    source_map = {s["id"]: s for s in draft["sources"]}
++    for source in new_sources:
++        require(isinstance(source, dict), "new source must be an object")
++        sid = source.get("id")
++        require(isinstance(sid, str) and ID.fullmatch(sid) and sid not in source_map,
++                "new source id must be unique; old sources cannot be rewritten")
++        require(source.get("role") == "user" and text(source.get("text")), "new sources must be user turns with text")
++        source_map[sid] = copy.deepcopy(source)
++        draft["sources"].append(copy.deepcopy(source))
++    _inspect(draft)
++    item_map = {i["id"]: i for i in draft["items"]}
++    seen, effective = set(), []
++    for entry in patches:
++        _validate_patch_entry(entry, source_map)
++        require(entry["id"] in item_map, "patch targets unknown item")
++        key = (entry["id"], entry["field"])
++        require(key not in seen, "duplicate patches for the same item field")
++        seen.add(key)
++        if item_map[entry["id"]][entry["field"]] != entry["new_value"]:
++            effective.append(entry)
++    if not effective:
++        return copy.deepcopy(record)  # Preserve current approval for a true no-op.
++    changes = draft.get("change_log", [])
++    require(isinstance(changes, list), "change_log must be an array")
++    grouped = {}
++    for entry in effective:
++        grouped.setdefault(entry["id"], []).append(entry)
++    before = {iid: copy.deepcopy(item_map[iid]) for iid in grouped}
++    for iid, entries in grouped.items():
++        item, new_evidence = item_map[iid], []
++        for entry in entries:
++            item[entry["field"]] = copy.deepcopy(entry["new_value"])
++            ev = {"source": entry["evidence"]["source"], "quote": entry["evidence"]["quote"]}
++            if ev not in new_evidence:
++                new_evidence.append(ev)
++        # An edit invalidates old consent even if the old item was ACTIVE.
++        if not any(e["field"] == "status" for e in entries):
++            item["status"] = "candidate"
++        item.pop("confirmation", None)
++        item["evidence"] = new_evidence
++    descendants = _descendants(set(grouped), item_map)
++    invalidated = []
++    for iid in sorted(descendants):
++        item = item_map[iid]
++        if item["status"] in ACTIVE:
++            before.setdefault(iid, copy.deepcopy(item))
++            item["status"] = "stale"
++            item.pop("confirmation", None)
++            invalidated.append(iid)
++    draft.pop("approval", None)
++    draft["change_log"] = changes + [{"parent_digest": parent["digest"],
++        "patches": copy.deepcopy(effective), "previous_items": before,
++        "new_source_ids": [s["id"] for s in new_sources], "invalidated": invalidated}]
++    _inspect(draft)
++    require(len(json.dumps(draft, ensure_ascii=False).encode("utf-8")) <= MAX_BYTES, "updated record exceeds 2 MB")
++    return draft
+ 
+ 
+-def apply_patches(record, patches):
+-    """Apply *patches* to a deep copy of *record* and return the updated draft.
+-
+-    Rules:
+-    - Input record is never mutated.
+-    - Each patch must reference a user-role source already in the record.
+-    - After applying value/status/kind changes to directly affected items, all active
+-      items that transitively depend on any changed item are marked stale.
+-    - The top-level ``approval`` key is removed (the draft is no longer approved).
+-    - The result is validated by inspect() before being returned.
+-    """
+-    # Deep-copy so we never mutate the caller's data.
+-    draft = copy.deepcopy(record)
+-
+-    source_map = {s["id"]: s for s in draft.get("sources", [])}
+-    item_map = {i["id"]: i for i in draft.get("items", [])}
+-
+-    # Validate all patches first so we fail atomically before touching draft.
+-    for entry in patches:
+-        _validate_patch_entry(entry, source_map)
+-        require(entry["id"] in item_map, f"patch targets unknown item id: {entry['id']!r}")
+-
+-    # Apply patches.
+-    directly_changed = set()
+-    for entry in patches:
+-        iid, field, new_value = entry["id"], entry["field"], entry["new_value"]
+-        item = item_map[iid]
+-        old_value = item.get(field)
+-        if old_value != new_value:
+-            item[field] = new_value
+-            # Only items whose value/status actually changed are propagation roots.
+-            directly_changed.add(iid)
+-
+-    # Propagate stale to all active transitive dependents.
+-    stale_ids = _transitive_stale(directly_changed, item_map)
+-    for iid in stale_ids:
+-        item_map[iid]["status"] = "stale"
+-        # Remove confirmation from stale items — it is no longer current.
+-        item_map[iid].pop("confirmation", None)
+-
+-    # Clear whole-brief approval — the draft has changed.
+-    draft.pop("approval", None)
+-
+-    # Validate the output with the existing checker.
+-    _inspect(draft)
+-
+-    return draft
++def _read_json(path):
++    with Path(path).open("rb") as f:
++        raw = f.read(MAX_BYTES + 1)
++    require(len(raw) <= MAX_BYTES, "JSON input exceeds 2 MB")
++    return json.loads(raw)
+ 
+ 
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("record", help="Existing JSON brief path (read-only)")
+-    parser.add_argument("patches", help="JSON array of patch objects, or a file path ending in .json")
+-    parser.add_argument("output", help="Output path for the updated draft (must not exist or use --force)")
+-    parser.add_argument("--force", action="store_true", help="Overwrite output if it already exists")
++    parser.add_argument("record", help="Read-only JSON brief")
++    parser.add_argument("patches", help="Changes JSON file or inline JSON")
++    parser.add_argument("output", help="New output file; must not already exist")
+     args = parser.parse_args()
+-
+     try:
+-        # Load record.
+-        record_path = Path(args.record)
+-        raw = record_path.read_bytes()
+-        require(len(raw) <= 2_000_000, "record exceeds 2 MB")
+-        record = json.loads(raw)
+-
+-        # Load patches — either inline JSON or a .json file path.
+-        if args.patches.strip().startswith("["):
+-            patches = json.loads(args.patches)
++        record_path, out_path = Path(args.record), Path(args.output)
++        require(out_path.resolve() != record_path.resolve(), "output must differ from input")
++        record = _read_json(record_path)
++        arg = args.patches.strip()
++        if arg.startswith(("[", "{")):
++            require(len(arg.encode("utf-8")) <= MAX_BYTES, "changes exceed 2 MB")
++            changes = json.loads(arg)
+         else:
+-            patch_path = Path(args.patches)
+-            patches = json.loads(patch_path.read_bytes())
+-        require(isinstance(patches, list), "patches must be a JSON array")
+-
+-        # Check output path.
+-        out_path = Path(args.output)
+-        require(args.force or not out_path.exists(), f"output file already exists: {out_path}  (use --force to overwrite)")
+-        require(out_path.resolve() != record_path.resolve(), "output must differ from input record")
+-
+-        draft = apply_patches(record, patches)
+-        out_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8")
+-        print(json.dumps({"updated": True, "output": str(out_path),
+-                          "stale_propagated": [i["id"] for i in draft["items"] if i["status"] == "stale"],
+-                          "approval_cleared": "approval" not in draft},
+-                         ensure_ascii=False, indent=2))
++            changes = _read_json(arg)
++        if isinstance(changes, dict):
++            require(set(changes) <= {"sources", "patches"}, "unknown changes field")
++            patches, sources = changes.get("patches"), changes.get("sources", [])
++        else:
++            patches, sources = changes, []
++        draft = apply_patches(record, patches, sources)
++        encoded = json.dumps(draft, ensure_ascii=False, indent=2)
++        require(len(encoded.encode("utf-8")) <= MAX_BYTES, "updated record exceeds 2 MB")
++        # O_EXCL atomically refuses existing paths, symlinks and hardlink aliases;
++        # no --force option can destroy prior input or snapshots.
++        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++        with os.fdopen(fd, "w", encoding="utf-8") as f:
++            f.write(encoded)
++        print(json.dumps({"updated": draft != record, "output": str(out_path),
++            "stale_items": [i["id"] for i in draft["items"] if i["status"] == "stale"],
++            "approval_cleared": "approval" in record and "approval" not in draft}, ensure_ascii=False))
+         return 0
+-
+-    except (ValueError, OSError, TypeError, KeyError, RecursionError) as exc:
++    except (ValueError, OSError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+         print(json.dumps({"updated": False, "error": str(exc)}, ensure_ascii=False))
+         return 2
+ 
+--- a/.bob/skills/intentconfirm/scripts/test_update_brief.py
++++ b/.bob/skills/intentconfirm/scripts/test_update_brief.py
+@@ -92,13 +92,13 @@
+         """Changing goal (A) must mark detail (B) and success (C) stale.
+         audience and no_login must remain confirmed and unchanged."""
+         record = chain_record()
+-        patch = [{"id": "goal", "field": "value", "new_value": "展示作品或业务",
++        patch = [{"id": "goal", "field": "value", "new_value": "作文练习",
+                   "evidence": {"source": "u3", "quote": "改成作文练习"}}]
+ 
+         draft = apply_patches(record, patch)
+ 
+         # A was changed
+-        self.assertEqual(draft["items"][0]["value"], "展示作品或业务")
++        self.assertEqual(draft["items"][0]["value"], "作文练习")
+         # B and C become stale
+         item = {i["id"]: i for i in draft["items"]}
+         self.assertEqual(item["detail"]["status"], "stale",
+@@ -136,22 +136,21 @@
+         record = with_approval(chain_record())
+         # Confirm approval is present before the update
+         self.assertIn("approval", record)
+-        patch = [{"id": "goal", "field": "value", "new_value": "展示作品或业务",
++        patch = [{"id": "goal", "field": "value", "new_value": "作文练习",
+                   "evidence": {"source": "u3", "quote": "改成作文练习"}}]
+ 
+         draft = apply_patches(record, patch)
+         self.assertNotIn("approval", draft,
+                          "approval must be cleared after any update")
+ 
+-    def test_approval_cleared_even_if_no_items_actually_changed(self):
+-        """Approval cleared even for no-op value patch (same value) — the approval
+-        refers to a moment in time, not just the item values."""
++    def test_noop_preserves_original_record_and_approval(self):
++        """An unchanged value must not erase valid user approval or create work."""
+         record = with_approval(chain_record())
+         # 'no-op' patch: same value as already in the record
+         patch = [{"id": "goal", "field": "value", "new_value": "学习与练习",
+                   "evidence": {"source": "u3", "quote": "改成作文练习"}}]
+         draft = apply_patches(record, patch)
+-        self.assertNotIn("approval", draft)
++        self.assertEqual(draft, record)
+ 
+     # ------------------------------------------------------------------
+     # 3. Original record is never mutated
+@@ -160,7 +159,7 @@
+         """apply_patches must not mutate the input dict."""
+         record = chain_record()
+         original = copy.deepcopy(record)
+-        patch = [{"id": "goal", "field": "value", "new_value": "展示作品或业务",
++        patch = [{"id": "goal", "field": "value", "new_value": "作文练习",
+                   "evidence": {"source": "u3", "quote": "改成作文练习"}}]
+         apply_patches(record, patch)
+         self.assertEqual(record, original, "input record must not be mutated")
+@@ -171,7 +170,7 @@
+     def test_output_is_structurally_valid(self):
+         """The output of apply_patches must pass the existing structural checker."""
+         record = chain_record()
+-        patch = [{"id": "goal", "field": "value", "new_value": "展示作品或业务",
++        patch = [{"id": "goal", "field": "value", "new_value": "作文练习",
+                   "evidence": {"source": "u3", "quote": "改成作文练习"}}]
+         draft = apply_patches(record, patch)
+         result = check_inspect(draft)
+@@ -184,7 +183,7 @@
+         """A patch citing an assistant source must be rejected."""
+         record = chain_record()
+         record["sources"].append({"id": "a1", "role": "assistant", "text": "建议改成作文练习"})
+-        patch = [{"id": "goal", "field": "value", "new_value": "展示作品或业务",
++        patch = [{"id": "goal", "field": "value", "new_value": "作文练习",
+                   "evidence": {"source": "a1", "quote": "建议改成作文练习"}}]
+         with self.assertRaises(ValueError, msg="assistant source must not satisfy patch evidence"):
+             apply_patches(record, patch)
+@@ -192,7 +191,7 @@
+     def test_patch_with_fabricated_quote_fails(self):
+         """A quote not present in the source text must be rejected."""
+         record = chain_record()
+-        patch = [{"id": "goal", "field": "value", "new_value": "展示作品或业务",
++        patch = [{"id": "goal", "field": "value", "new_value": "作文练习",
+                   "evidence": {"source": "u3", "quote": "这段话不存在于 u3"}}]
+         with self.assertRaises(ValueError, msg="quote not in source must be rejected"):
+             apply_patches(record, patch)
+@@ -211,7 +210,7 @@
+     def test_stale_items_lose_their_confirmation_field(self):
+         """Items made stale by propagation must have their confirmation removed."""
+         record = chain_record()
+-        patch = [{"id": "goal", "field": "value", "new_value": "展示作品或业务",
++        patch = [{"id": "goal", "field": "value", "new_value": "作文练习",
+                   "evidence": {"source": "u3", "quote": "改成作文练习"}}]
+         draft = apply_patches(record, patch)
+         item = {i["id"]: i for i in draft["items"]}
+@@ -228,7 +227,7 @@
+     # ------------------------------------------------------------------
+     def test_cli_writes_output_and_does_not_modify_input(self):
+         script = _SCRIPTS / "update_brief.py"
+-        patch = [{"id": "goal", "field": "value", "new_value": "展示作品或业务",
++        patch = [{"id": "goal", "field": "value", "new_value": "作文练习",
+                   "evidence": {"source": "u3", "quote": "改成作文练习"}}]
+         with tempfile.TemporaryDirectory() as tmp:
+             inp = pathlib.Path(tmp) / "input.json"
+@@ -254,7 +253,7 @@
+ 
+     def test_cli_refuses_to_overwrite_output_without_force(self):
+         script = _SCRIPTS / "update_brief.py"
+-        patch = [{"id": "goal", "field": "value", "new_value": "展示作品或业务",
++        patch = [{"id": "goal", "field": "value", "new_value": "作文练习",
+                   "evidence": {"source": "u3", "quote": "改成作文练习"}}]
+         with tempfile.TemporaryDirectory() as tmp:
+             inp = pathlib.Path(tmp) / "input.json"
+@@ -271,7 +270,7 @@
+ 
+     def test_cli_refuses_to_write_output_same_as_input(self):
+         script = _SCRIPTS / "update_brief.py"
+-        patch = [{"id": "goal", "field": "value", "new_value": "展示作品或业务",
++        patch = [{"id": "goal", "field": "value", "new_value": "作文练习",
+                   "evidence": {"source": "u3", "quote": "改成作文练习"}}]
+         with tempfile.TemporaryDirectory() as tmp:
+             inp = pathlib.Path(tmp) / "input.json"
+@@ -294,7 +293,7 @@
+             "kind": "requirement", "status": "rejected", "critical": False,
+             "depends_on": [], "evidence": [],
+         })
+-        patch = [{"id": "goal", "field": "value", "new_value": "展示作品或业务",
++        patch = [{"id": "goal", "field": "value", "new_value": "作文练习",
+                   "evidence": {"source": "u3", "quote": "改成作文练习"}}]
+         draft = apply_patches(record, patch)
+         item = {i["id"]: i for i in draft["items"]}
+--- a/.bob/skills/intentconfirm/references/record-format.md
++++ b/.bob/skills/intentconfirm/references/record-format.md
+@@ -1,4 +1,6 @@
+ # Optional local brief records
++
++Contents: [Shape](#shape) · [Run](#run) · [Approval and versions](#whole-brief-approval-and-versions) · [Updates](#applying-updates-with-update_briefpy)
+ 
+ Use for durable, structured handoffs only; ordinary conversations do not need a JSON transcript. Keep task records in the user's chosen project/output location, outside the reusable skill. The optional checker uses Python 3.9+ standard library, reads one local JSON file, and never edits it or contacts a model.
+ 
+@@ -79,3 +81,33 @@
+ The tool cannot authenticate who sent the evidence, prove semantic correctness, or select a replacement value on behalf of the user. Invalid dependency references, dependency cycles, or missing patch evidence cause exit code 2 without writing output.
+ 
+ Exit 0 prints a JSON summary of stale-propagated IDs and confirms `approval_cleared: true`. Exit 2 prints `{"updated": false, "error": "..."}`.
++
++## Applying updates with update_brief.py
++
++Run the optional offline updater when a user changes a recorded decision:
++
++```sh
++python3 scripts/update_brief.py old_brief.json changes.json new_brief.json
++```
++
++Use a new output filename each time. There is no overwrite/force mode. Existing files, symlinks and hardlink aliases are refused. Preserve approved versions; do not edit them first just to insert new conversation turns.
++
++Supply a JSON object to add the new user turn and its changes together:
++
++```json
++{
++  "sources": [{"id":"u3","role":"user","text":"改成作文练习"}],
++  "patches": [{"id":"goal","field":"value","new_value":"作文练习",
++    "evidence":{"source":"u3","quote":"改成作文练习"}}]
++}
++```
++
++This is a synthetic format example, not user authorization. Each new source needs a unique ID; existing sources cannot be rewritten. A bare patch array remains supported when its evidence sources already exist. Each patch cites a user source with an exact quote. This only validates quotation existence, not the semantic inference or who actually spoke.
++
++The updater validates the old record before any processing and the complete new draft before writing. Patch fields: value, label, kind, critical, status. It rejects duplicate patches to the same item/field, even if identical, and refuses status changes to stated/confirmed. Never fabricate evidence to pass validation.
++
++A semantic edit makes the changed item a candidate and removes old confirmation; explicitly requested unknown/stale/rejected/excluded status remains unaccepted. New patch evidence replaces current evidence, while previous item versions and actual patches are kept in change_log. User sources remain available. Active downstream dependencies become stale transitively, including across batches. Unchanged and unrelated items are preserved. Actual changes clear whole-brief approval; an empty or no-op batch preserves the original record and approval exactly.
++
++Use a later actual user response to adopt the revised candidate in the host's normal record workflow, then run check_brief.py. The update tool itself does not auto-approve or authenticate that response. A reviewed brief can still contain semantic omissions; this is not an independent permission gate.
++
++Exit 0 means a new output file was written; exit 2 means failure. The CLI reports updated, stale_items, and whether an existing approval was cleared. Input/changes/output are limited to 2 MB. New output files are private by default. File writes may fail for ordinary filesystem reasons; success must be read from the result, not assumed.

@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>学习进度</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    background: #f7f8fa;
+    color: #1f2328;
+    min-height: 100vh;
+    padding: 24px 16px 48px;
+  }
+  .wrap { max-width: 680px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 24px; }
+
+  /* Add form */
+  .add-form {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 28px;
+    display: grid;
+    gap: 10px;
+  }
+  .add-form .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .add-form input[type="text"],
+  .add-form input[type="number"] {
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 14px;
+    color: #1f2328;
+    background: #fff;
+  }
+  .add-form input[type="text"] { flex: 1; min-width: 180px; }
+  .add-form input[type="number"] { width: 90px; }
+  .add-form label { font-size: 13px; color: #57606a; display: flex; align-items: center; gap: 6px; }
+  .btn {
+    border: none;
+    border-radius: 6px;
+    padding: 7px 16px;
+    font-size: 14px;
+    cursor: pointer;
+    font-weight: 500;
+    transition: opacity .15s;
+  }
+  .btn:hover { opacity: .85; }
+  .btn-primary { background: #3b82d4; color: #fff; }
+  .btn-sm { padding: 4px 10px; font-size: 13px; }
+  .btn-done { background: #e9f0fb; color: #3b82d4; }
+  .btn-del  { background: #fef2f2; color: #b91c1c; }
+  .btn-save { background: #d1fae5; color: #065f46; }
+
+  /* Section headings */
+  .section-title {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: #57606a;
+    margin: 0 0 10px;
+  }
+
+  /* Item card */
+  .item {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 10px;
+  }
+  .item.done {
+    opacity: .6;
+    border-style: dashed;
+  }
+  .item-header { display: flex; align-items: flex-start; gap: 10px; }
+  .item-title {
+    flex: 1;
+    font-weight: 500;
+    font-size: 15px;
+    word-break: break-word;
+  }
+  .item.done .item-title { text-decoration: line-through; color: #57606a; }
+  .badge {
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 99px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .badge-done { background: #d1fae5; color: #065f46; }
+  .badge-pct  { background: #e9f0fb; color: #1e40af; }
+
+  /* Progress bar */
+  .progress-wrap { margin: 10px 0 6px; }
+  .progress-bar-bg {
+    height: 6px;
+    background: #e5e7eb;
+    border-radius: 99px;
+    overflow: hidden;
+  }
+  .progress-bar-fill {
+    height: 100%;
+    background: #3b82d4;
+    border-radius: 99px;
+    transition: width .3s;
+  }
+  .item.done .progress-bar-fill { background: #6ee7b7; }
+
+  /* Edit row */
+  .edit-row {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px;
+  }
+  .edit-row input { width: 80px; }
+  .edit-row .note { font-size: 13px; color: #57606a; }
+  .actions { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+
+  .empty { color: #57606a; font-size: 14px; padding: 12px 0; }
+
+  /* Sections spacing */
+  .section + .section { margin-top: 32px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📚 学习进度</h1>
+
+  <!-- Add form -->
+  <form class="add-form" id="addForm">
+    <div class="row">
+      <input type="text" id="newTitle" placeholder="书名 / 课程 / 资料名称" required maxlength="120">
+    </div>
+    <div class="row">
+      <label>当前章节 / 位置
+        <input type="text" id="newChapter" placeholder="例如：第3章" maxlength="60">
+      </label>
+      <label>完成 %
+        <input type="number" id="newPct" placeholder="0" min="0" max="100" value="0">
+      </label>
+    </div>
+    <div>
+      <button type="submit" class="btn btn-primary">+ 添加</button>
+    </div>
+  </form>
+
+  <!-- In-progress section -->
+  <div class="section" id="sectionActive">
+    <p class="section-title">进行中</p>
+    <div id="listActive"></div>
+  </div>
+
+  <!-- Done section -->
+  <div class="section" id="sectionDone" style="display:none">
+    <p class="section-title">已完成</p>
+    <div id="listDone"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  const STORE_KEY = 'study-log-v1';
+
+  // ── persistence ──────────────────────────────────────────
+  function load() {
+    try {
+      const raw = localStorage.getItem(STORE_KEY);
+      if (!raw) return [];
+      const data = JSON.parse(raw);
+      return Array.isArray(data) ? data : [];
+    } catch { return []; }
+  }
+
+  function save(items) {
+    localStorage.setItem(STORE_KEY, JSON.stringify(items));
+  }
+
+  // ── helpers ───────────────────────────────────────────────
+  let items = load();
+
+  function nextId() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  }
+
+  function clampPct(v) {
+    const n = parseInt(v, 10);
+    if (isNaN(n)) return 0;
+    return Math.max(0, Math.min(100, n));
+  }
+
+  // ── render ────────────────────────────────────────────────
+  function render() {
+    const active = items.filter(i => !i.done).sort((a, b) => b.pct - a.pct);
+    const done   = items.filter(i => i.done).sort((a, b) => b.doneAt - a.doneAt);
+
+    renderList('listActive', active, false);
+    renderList('listDone',   done,   true);
+
+    document.getElementById('sectionDone').style.display = done.length ? '' : 'none';
+  }
+
+  function renderList(containerId, subset, isDoneSection) {
+    const el = document.getElementById(containerId);
+    if (subset.length === 0) {
+      el.innerHTML = '<p class="empty">' + (isDoneSection ? '暂无' : '还没有记录，添加第一项吧。') + '</p>';
+      return;
+    }
+    el.innerHTML = '';
+    subset.forEach(item => {
+      el.appendChild(buildCard(item));
+    });
+  }
+
+  function buildCard(item) {
+    const div = document.createElement('div');
+    div.className = 'item' + (item.done ? ' done' : '');
+    div.dataset.id = item.id;
+
+    const pctLabel = item.done
+      ? '<span class="badge badge-done">已完成</span>'
+      : '<span class="badge badge-pct">' + item.pct + '%</span>';
+
+    const chapterText = item.chapter ? escHtml(item.chapter) : '';
+
+    div.innerHTML = `
+      <div class="item-header">
+        <span class="item-title">${escHtml(item.title)}</span>
+        ${pctLabel}
+      </div>
+      ${chapterText ? `<div style="font-size:13px;color:#57606a;margin-top:4px">${chapterText}</div>` : ''}
+      <div class="progress-wrap">
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill" style="width:${item.pct}%"></div>
+        </div>
+      </div>
+      ${!item.done ? `
+      <div class="edit-row">
+        <input type="text"   class="js-chap" placeholder="章节/位置" value="${escAttr(item.chapter)}" maxlength="60">
+        <input type="number" class="js-pct"  placeholder="%" value="${item.pct}" min="0" max="100" style="width:70px">
+        <button class="btn btn-sm btn-save js-save">保存</button>
+        <span class="note">更新进度</span>
+      </div>
+      <div class="actions">
+        <button class="btn btn-sm btn-done js-done">✓ 标记完成</button>
+        <button class="btn btn-sm btn-del  js-del">删除</button>
+      </div>` : `
+      <div class="actions">
+        <button class="btn btn-sm btn-del js-del">删除记录</button>
+      </div>`}
+    `;
+
+    // events
+    if (!item.done) {
+      div.querySelector('.js-save').addEventListener('click', () => {
+        const chap = div.querySelector('.js-chap').value.trim();
+        const pct  = clampPct(div.querySelector('.js-pct').value);
+        updateItem(item.id, { chapter: chap, pct });
+      });
+      div.querySelector('.js-done').addEventListener('click', () => {
+        updateItem(item.id, { done: true, doneAt: Date.now(), pct: 100 });
+      });
+    }
+    div.querySelector('.js-del').addEventListener('click', () => {
+      if (confirm('删除"' + item.title + '"？')) {
+        items = items.filter(i => i.id !== item.id);
+        save(items);
+        render();
+      }
+    });
+
+    return div;
+  }
+
+  // ── mutations ─────────────────────────────────────────────
+  function updateItem(id, patch) {
+    items = items.map(i => i.id === id ? Object.assign({}, i, patch) : i);
+    save(items);
+    render();
+  }
+
+  // ── add form ──────────────────────────────────────────────
+  document.getElementById('addForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+    const title   = document.getElementById('newTitle').value.trim();
+    const chapter = document.getElementById('newChapter').value.trim();
+    const pct     = clampPct(document.getElementById('newPct').value);
+    if (!title) return;
+    items.push({ id: nextId(), title, chapter, pct, done: false, doneAt: null, addedAt: Date.now() });
+    save(items);
+    this.reset();
+    document.getElementById('newPct').value = '0';
+    render();
+  });
+
+  // ── escape helpers ────────────────────────────────────────
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+  function escAttr(s) { return escHtml(s); }
+
+  // ── init ──────────────────────────────────────────────────
+  render();
+})();
+</script>
+</body>
+</html>

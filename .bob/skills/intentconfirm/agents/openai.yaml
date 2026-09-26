@@ -1,0 +1,14 @@
+interface:
+  display_name: IntentConfirm
+  short_description: Clarify vague requests with choices before execution
+  default_prompt: Use $intentconfirm to clarify my idea with a few concrete choices
+    before starting.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

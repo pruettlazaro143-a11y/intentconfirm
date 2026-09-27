@@ -1,6 +1,6 @@
 {
   "name": "intentconfirm",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "private": true,
   "description": "Clarify incomplete requests inside your AI assistant before implementation",
   "scripts": {
@@ -9,7 +9,9 @@
     "test:browser": "node tests/browser-smoke.cjs",
     "setup": "node scripts/setup.cjs",
     "test:ai-browser": "node tests/ai-browser.cjs",
-    "pack": "node scripts/pack.cjs"
+    "pack": "node scripts/pack.cjs",
+    "pack:skill": "python3 scripts/package_skill.py",
+    "test:distribution": "python3 -m unittest discover -s scripts -p 'test_*.py'"
   },
   "engines": {
     "node": ">=18"
